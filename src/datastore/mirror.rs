@@ -1,138 +1,25 @@
-//! 本地镜像后端：把 Personal Geodatabase 的表结构 + 数据完整镜像为单个 JSON 文件。
+//! 内存镜像后端：把 Personal Geodatabase 的表结构 + 数据完整保存在进程内存里。
 //!
 //! 用途：
-//! 1. 在没有 ACE/Jet ODBC 驱动的平台（Linux/macOS）上，仍然可以完整演练
-//!    目录遍历、要素更新、Shape 二进制读写等全部逻辑；
-//! 2. 单元测试与集成测试的确定性数据源；
-//! 3. mdb 内容的离线快照（`pgdb-cli export`）。
+//! 1. 在单元测试 / 集成测试里充当确定性的数据源，演练目录遍历、要素更新、
+//!    Shape 二进制读写等全部逻辑，而无需任何 ODBC 驱动；
+//! 2. 作为 `SqlBackend` 的一种实现，与 ODBC 后端共享上层的目录 / 游标逻辑。
 //!
-//! 镜像是"数据副本"，并非 Access 文件格式本身。
+//! 该后端**不落盘、不涉及任何 JSON 序列化**：它只是数据库在内存中的一份副本。
+//! 需要持久化时，请直接对真实 `*.mdb` 使用 ODBC 后端。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use serde::{Deserialize, Serialize};
-
 use crate::datastore::predicate_matches;
-use crate::error::{PgdbError, Result};
-use crate::field::FieldType;
+use crate::error::Result;
 use crate::value::SqlValue;
 
 use super::{BackendCapabilities, ColumnDef, DataTableRow, Predicate, SqlBackend};
 
-/// 序列化用的列表示
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnRepr {
-    name: String,
-    sql_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scale: Option<usize>,
-    #[serde(default = "default_true")]
-    nullable: bool,
-    #[serde(default)]
-    is_auto: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// 序列化用的值表示（二进制列以十六进制字符串存储，控制文件体积）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v")]
-pub enum ValueRepr {
-    Null,
-    Bool(bool),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    Text(String),
-    Decimal(String),
-    DateTime(String),
-    Binary(String),
-    Guid(String),
-}
-
-impl From<&SqlValue> for ValueRepr {
-    fn from(v: &SqlValue) -> Self {
-        match v {
-            SqlValue::Null => ValueRepr::Null,
-            SqlValue::Bool(b) => ValueRepr::Bool(*b),
-            SqlValue::I16(v) => ValueRepr::I16(*v),
-            SqlValue::I32(v) => ValueRepr::I32(*v),
-            SqlValue::I64(v) => ValueRepr::I64(*v),
-            SqlValue::F32(v) => ValueRepr::F32(*v),
-            SqlValue::F64(v) => ValueRepr::F64(*v),
-            SqlValue::Text(s) => ValueRepr::Text(s.clone()),
-            SqlValue::Decimal(s) => ValueRepr::Decimal(s.clone()),
-            SqlValue::DateTime(d) => ValueRepr::DateTime(d.to_rfc3339()),
-            SqlValue::Binary(b) => ValueRepr::Binary(hex::encode(b)),
-            SqlValue::Guid(s) => ValueRepr::Guid(s.clone()),
-        }
-    }
-}
-
-impl TryFrom<ValueRepr> for SqlValue {
-    type Error = PgdbError;
-    fn try_from(v: ValueRepr) -> Result<Self> {
-        Ok(match v {
-            ValueRepr::Null => SqlValue::Null,
-            ValueRepr::Bool(b) => SqlValue::Bool(b),
-            ValueRepr::I16(v) => SqlValue::I16(v),
-            ValueRepr::I32(v) => SqlValue::I32(v),
-            ValueRepr::I64(v) => SqlValue::I64(v),
-            ValueRepr::F32(v) => SqlValue::F32(v),
-            ValueRepr::F64(v) => SqlValue::F64(v),
-            ValueRepr::Text(s) => SqlValue::Text(s),
-            ValueRepr::Decimal(s) => SqlValue::Decimal(s),
-            ValueRepr::DateTime(s) => SqlValue::DateTime(
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .map_err(|e| PgdbError::Serialize(e.to_string()))?
-                    .with_timezone(&chrono::Utc),
-            ),
-            ValueRepr::Binary(h) => SqlValue::Binary(
-                hex::decode(h).map_err(|e| PgdbError::Serialize(e.to_string()))?,
-            ),
-            ValueRepr::Guid(s) => SqlValue::Guid(s),
-        })
-    }
-}
-
-/// 序列化用的表表示
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableRepr {
-    name: String,
-    #[serde(default)]
-    columns: Vec<ColumnRepr>,
-    /// 每行一组值，与 columns 顺序一致
-    #[serde(default)]
-    rows: Vec<Vec<ValueRepr>>,
-    /// 自增列的下一位取值（缺省时由现有数据推导）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_auto: Option<i64>,
-}
-
-/// 镜像文件整体结构
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MirrorFile {
-    /// 文件格式版本
-    pub version: u32,
-    /// 原始 mdb 路径（仅记录用）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// 全部表
-    pub tables: Vec<TableRepr>,
-}
-
 /// 内存中的表
 #[derive(Debug, Clone)]
 struct Table {
-    name: String,
     columns: Vec<ColumnDef>,
     rows: Vec<Vec<SqlValue>>,
     /// 自增列下标
@@ -148,12 +35,12 @@ impl Table {
 
     fn build_row(&self, values: &[(String, SqlValue)], assign_auto: Option<i64>) -> Result<Vec<SqlValue>> {
         let mut out = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
+        for (idx, col) in self.columns.iter().enumerate() {
             if let Some((_, v)) = values.iter().find(|(n, _)| n.eq_ignore_ascii_case(&col.name)) {
                 out.push(v.clone());
                 continue;
             }
-            let auto_here = Some(true) == self.columns.get(out.len()).map(|c| c.is_auto);
+            let auto_here = Some(idx) == self.auto_column;
             if let Some(next) = assign_auto.filter(|_| auto_here) {
                 out.push(SqlValue::I64(next));
                 continue;
@@ -186,12 +73,9 @@ impl Table {
     }
 }
 
-/// 本地镜像后端
+/// 内存镜像后端
 pub struct MirrorBackend {
     state: RwLock<MirrorState>,
-    source_hint: Option<String>,
-    /// 镜像文件路径（存在时 `flush()` 会写回该文件）
-    file_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -201,142 +85,14 @@ struct MirrorState {
 }
 
 impl MirrorBackend {
-    /// 创建空镜像
+    /// 创建空的内存数据库
     pub fn new() -> Self {
         Self {
             state: RwLock::new(MirrorState::default()),
-            source_hint: None,
-            file_path: None,
         }
     }
 
-    /// 镜像文件路径（若由文件加载）
-    pub fn path(&self) -> Option<&Path> {
-        self.file_path.as_deref()
-    }
-
-    /// 把当前内存状态写回来源文件；没有来源文件时返回 None
-    pub fn save(&self) -> Result<Option<std::path::PathBuf>> {
-        let Some(path) = self.file_path.clone() else {
-            return Ok(None);
-        };
-        self.save_file(&path)?;
-        Ok(Some(path))
-    }
-
-    /// 从 JSON 文件加载镜像
-    pub fn open_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let text = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| PgdbError::io(format!("读取镜像 {}", path.as_ref().display()), e))?;
-        let mut backend = Self::from_json(&text)?;
-        backend.file_path = Some(path.as_ref().to_path_buf());
-        Ok(backend)
-    }
-
-    /// 由 JSON 文本构造
-    pub fn from_json(text: &str) -> Result<Self> {
-        let file: MirrorFile =
-            serde_json::from_str(text).map_err(|e| PgdbError::Serialize(e.to_string()))?;
-        let backend = Self {
-            state: RwLock::new(MirrorState::default()),
-            source_hint: file.source.clone(),
-            file_path: None,
-        };
-        {
-            let mut st = backend.state.write().unwrap();
-            for t in file.tables {
-                let columns: Vec<ColumnDef> = t
-                    .columns
-                    .iter()
-                    .map(|c| ColumnDef {
-                        name: c.name.clone(),
-                        sql_type: c.sql_type.clone(),
-                        size: c.size,
-                        scale: c.scale,
-                        nullable: c.nullable,
-                        is_auto: c.is_auto,
-                        kind: FieldType::from_sql_type(&c.sql_type),
-                    })
-                    .collect();
-                let auto_column = columns.iter().position(|c| c.is_auto);
-                let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(t.rows.len());
-                for r in &t.rows {
-                    let mut vals = Vec::with_capacity(r.len());
-                    for v in r {
-                        vals.push(SqlValue::try_from(v.clone())?);
-                    }
-                    rows.push(vals);
-                }
-                // 推导自增值
-                let next_auto = t.next_auto.unwrap_or_else(|| match auto_column {
-                    Some(ci) => rows
-                        .iter()
-                        .filter_map(|r| r.get(ci).map(|v| v.to_i64().unwrap_or(0)))
-                        .max()
-                        .map(|m| m + 1)
-                        .unwrap_or(1),
-                    None => 1,
-                });
-                st.order.push(t.name.clone());
-                st.tables.insert(
-                    t.name.clone(),
-                    Table {
-                        name: t.name.clone(),
-                        columns,
-                        rows,
-                        auto_column,
-                        next_auto,
-                    },
-                );
-            }
-        }
-        Ok(backend)
-    }
-
-    /// 序列化为 JSON 文本
-    pub fn to_json(&self) -> Result<String> {
-        let st = self.state.read().unwrap();
-        let mut tables = Vec::with_capacity(st.order.len());
-        for name in &st.order {
-            let t = &st.tables[name];
-            tables.push(TableRepr {
-                name: t.name.clone(),
-                columns: t
-                    .columns
-                    .iter()
-                    .map(|c| ColumnRepr {
-                        name: c.name.clone(),
-                        sql_type: c.sql_type.clone(),
-                        size: c.size,
-                        scale: c.scale,
-                        nullable: c.nullable,
-                        is_auto: c.is_auto,
-                    })
-                    .collect(),
-                rows: t
-                    .rows
-                    .iter()
-                    .map(|r| r.iter().map(ValueRepr::from).collect())
-                    .collect(),
-                next_auto: Some(t.next_auto),
-            });
-        }
-        let file = MirrorFile {
-            version: 1,
-            source: self.source_hint.clone(),
-            tables,
-        };
-        serde_json::to_string_pretty(&file).map_err(|e| PgdbError::Serialize(e.to_string()))
-    }
-
-    /// 保存到 JSON 文件
-    pub fn save_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let json = self.to_json()?;
-        std::fs::write(path.as_ref(), json)
-            .map_err(|e| PgdbError::io(format!("写入镜像 {}", path.as_ref().display()), e))
-    }
-
-    /// 新建一张表（供测试与 mdb->镜像 导出使用）
+    /// 新建一张表（供测试与内存构造使用）
     pub fn create_table(&self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
         let mut st = self.state.write().unwrap();
         Self::create_table_locked(&mut st, name, columns)
@@ -350,7 +106,6 @@ impl MirrorBackend {
         st.tables.insert(
             name.to_string(),
             Table {
-                name: name.to_string(),
                 columns,
                 rows: Vec::new(),
                 auto_column,
@@ -365,7 +120,7 @@ impl MirrorBackend {
         let t = st
             .tables
             .get(table)
-            .ok_or_else(|| PgdbError::NotFound(format!("表 {table}")))?;
+            .ok_or_else(|| crate::error::PgdbError::NotFound(format!("表 {table}")))?;
         f(t)
     }
 }
@@ -378,7 +133,7 @@ impl Default for MirrorBackend {
 
 impl SqlBackend for MirrorBackend {
     fn kind(&self) -> &'static str {
-        "mirror"
+        "memory"
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -437,7 +192,7 @@ impl SqlBackend for MirrorBackend {
         let t = st
             .tables
             .get_mut(table)
-            .ok_or_else(|| PgdbError::NotFound(format!("表 {table}")))?;
+            .ok_or_else(|| crate::error::PgdbError::NotFound(format!("表 {table}")))?;
         let mut affected = 0u64;
         for i in 0..t.rows.len() {
             let row = t.to_data_row(i, &[]);
@@ -452,7 +207,9 @@ impl SqlBackend for MirrorBackend {
                 {
                     t.rows[i][ci] = value.clone();
                 } else {
-                    return Err(PgdbError::NotFound(format!("表 {table} 中不存在字段 {name}")));
+                    return Err(crate::error::PgdbError::NotFound(format!(
+                        "表 {table} 中不存在字段 {name}"
+                    )));
                 }
             }
             affected += 1;
@@ -465,7 +222,7 @@ impl SqlBackend for MirrorBackend {
         let t = st
             .tables
             .get_mut(table)
-            .ok_or_else(|| PgdbError::NotFound(format!("表 {table}")))?;
+            .ok_or_else(|| crate::error::PgdbError::NotFound(format!("表 {table}")))?;
         let auto_slot = t.auto_column;
         let provided_auto = match auto_slot {
             Some(ci) => values
@@ -493,7 +250,7 @@ impl SqlBackend for MirrorBackend {
         let t = st
             .tables
             .get_mut(table)
-            .ok_or_else(|| PgdbError::NotFound(format!("表 {table}")))?;
+            .ok_or_else(|| crate::error::PgdbError::NotFound(format!("表 {table}")))?;
         if matches!(filter, Predicate::All) {
             let n = t.rows.len() as u64;
             t.rows.clear();
@@ -518,40 +275,16 @@ impl SqlBackend for MirrorBackend {
     }
 
     fn flush(&self) -> Result<()> {
-        if self.file_path.is_some() {
-            self.save()?;
-        }
+        // 纯内存后端，无需持久化。
         Ok(())
-    }
-}
-
-mod hex {
-    /// 字节转十六进制字符串
-    pub fn encode(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2 + 2);
-        s.push_str("0x");
-        for b in bytes {
-            s.push_str(&format!("{b:02X}"));
-        }
-        s
-    }
-
-    /// 十六进制字符串转字节
-    pub fn decode(s: String) -> Result<Vec<u8>, String> {
-        let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-        if s.len() % 2 != 0 {
-            return Err("十六进制长度不是偶数".to_string());
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::Predicate;
+    use crate::field::FieldType;
 
     fn sample_store() -> MirrorBackend {
         let b = MirrorBackend::new();
@@ -574,12 +307,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mirror_roundtrip_file() {
+    fn test_mirror_lookup() {
         let b = sample_store();
-        let json = b.to_json().unwrap();
-        let b2 = MirrorBackend::from_json(&json).unwrap();
-        assert_eq!(b2.table_names().unwrap(), vec!["GDB_Items".to_string()]);
-        let rows = b2.select("GDB_Items", &[], &Predicate::All).unwrap();
+        assert_eq!(b.table_names().unwrap(), vec!["GDB_Items".to_string()]);
+        let rows = b.select("GDB_Items", &[], &Predicate::All).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get("Name").unwrap().to_display_string(),
@@ -651,9 +382,7 @@ mod tests {
         let payload = vec![1u8, 2, 3, 0xFF];
         b.insert("FC", &[("Shape".into(), SqlValue::Binary(payload.clone()))])
             .unwrap();
-        let json = b.to_json().unwrap();
-        let b2 = MirrorBackend::from_json(&json).unwrap();
-        let rows = b2.select("FC", &[], &Predicate::All).unwrap();
+        let rows = b.select("FC", &[], &Predicate::All).unwrap();
         assert_eq!(rows[0].get("Shape").unwrap().to_binary().unwrap(), &payload[..]);
     }
 }

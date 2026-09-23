@@ -16,7 +16,7 @@
 | **属性更新** | `ITable::Update` + `IRow::put_Value` + `IRow::Store`，**只 UPDATE 真正赋值的列** |
 | **几何更新** | `IFeatureClass::Update` + `IFeature::put_Shape` + `IFeature::Store` |
 | **ESRI 一致性自动维护** | 写几何时自动重算 `Shape_Length`/`Shape_Area`、同步 `<表>_SHAPE_Index` 网格记录、更新 `GDB_GeomColumns` 图层范围，并按 ESRI 约定归一化面环方向 |
-| **双后端** | `odbc` 后端直连真实 mdb；`mirror` 后端用单个 JSON 文件做完整数据镜像（**Linux/macOS 无驱动也能跑通全部逻辑**） |
+| **内存后端** | 纯内存镜像后端（无 JSON、不落盘），用于单元测试与无驱动环境的逻辑演练 |
 | **空间过滤** | `ISpatialFilter` 语义的包络粗筛 + 内存精算 |
 | **CLI 工具** | `list / fields / rows / export-wkt / update-attr / set-geometry / create-feature / delete-rows / rebuild-index / sql` |
 
@@ -39,7 +39,7 @@ src/
 ├── datastore/
 │   ├── mod.rs              # trait SqlBackend + 结构化 Predicate（不用字符串拼 SQL）
 │   ├── odbc.rs             # ODBC 后端（Windows ACE 可读写 / Linux MDBTools 只读）
-│   └── mirror.rs           # 本地 JSON 镜像后端（无驱动环境的主力）
+│   └── mirror.rs           # 内存镜像后端（纯内存，无 JSON、不落盘）
 └── gdb/
     ├── mod.rs              # 对象模型聚合出口
     ├── factory.rs          # AccessWorkspaceFactory   -> IWorkspaceFactory
@@ -54,7 +54,7 @@ src/
     └── filter.rs           # QueryFilter / SpatialFilter -> IQueryFilter / ISpatialFilter
 
 src/bin/pgdb-cli.rs         # 命令行工具
-examples/                   # make_sample / traverse / update / shape_codec
+examples/                   # traverse / update / shape_codec
 tests/                      # harness.rs（构造假库）+ integration.rs（10 个用例）
 ```
 
@@ -63,36 +63,68 @@ tests/                      # harness.rs（构造假库）+ integration.rs（10 
 ## 编译
 
 ```bash
-cargo build                    # 仅镜像后端
-cargo build --features odbc    # 追加 ODBC 后端（需要 unixODBC 开发库：apt install unixodbc-dev）
-cargo test                      # 单元测试 + 集成测试 + 文档测试
+cargo build    # 两种后端（jetdb 只读 + ODBC 读写）已全部内置，无需任何 feature 开关
+               # Linux 若要从源码编译，需 unixODBC 开发库：apt install unixodbc-dev
+cargo test     # 单元测试 + 集成测试 + 文档测试
 ```
 
-驱动要求：
+---
+
+## 两种解析后端：由「读写权限」在运行时选择
+
+同一条 `.mdb` 有两条解析路径，**不需要在编译期挑选 feature**，由打开时的读写权限决定：
+
+| 读写权限 | 后端 | 是否需要驱动 | 能力 |
+|----------|------|--------------|------|
+| `AccessMode::ReadOnly` | 纯 Rust 的 **jetdb** | **不需要**，跨平台（含 WASM） | 仅查询 |
+| `AccessMode::ReadWrite` | **ODBC** | 需要与程序位数匹配的 Access/ACE 驱动 | 查询 + 写入 |
+
+选择原则很直白：**只想看数据**就用只读模式（零依赖、随处可跑）；**需要改数据**才用读写模式。
+
+```rust
+use pgdb::gdb::{AccessMode, AccessWorkspaceFactory};
+
+// 只读：纯 Rust 解析 test.mdb，无需安装任何驱动
+let ws = AccessWorkspaceFactory::open_with_mode("test.mdb", AccessMode::ReadOnly, None)?;
+
+// 读写：走 ODBC（Windows 需装好与程序位数匹配的 ACE 驱动）
+let ws = AccessWorkspaceFactory::open_with_mode("test.mdb", AccessMode::ReadWrite, None)?;
+```
+
+命令行对应 `--access`：
+
+```bash
+pgdb-cli test.mdb --access readonly  tree     # jetdb，无需驱动
+pgdb-cli test.mdb --access readwrite info     # ODBC，需驱动
+pgdb-cli test.mdb --read-only        rows QLR # readonly 的简写
+```
+
+> 只读模式下任何写操作都会被**明确拒绝**（并提示改用 `--access readwrite`），
+> 不会静默失败或写坏文件。
+
+### ODBC 驱动要求（仅读写模式需要）
 
 | 平台 | 驱动 | 能力 |
 |------|------|------|
 | Windows | Microsoft Access Driver（`*.mdb`）/ ACE | **读写** |
-| Linux | MDBTools ODBC 驱动（`libmdbodbc`） | **只读** |
-| 任意 | 无需驱动，使用 JSON 镜像 | 读写（镜像回到真实库需自行写回） |
+| Linux | MDBTools ODBC 驱动（`libmdbodbc`） | 仅只读 |
 
-> 没有 mdb 或没有驱动也能完整体验：`examples/make_sample.rs` 会生成一份结构与真实 PGDB 一致的镜像文件。
+> 只读模式（jetdb）不依赖上表任何驱动，因此在 Linux / CI / 容器里也能完整做数据探查。
+> 另外，`tests/harness.rs` 会在内存里构造与真实 PGDB 结构一致的假库，
+> 无需任何驱动即可完整跑通单元测试与集成测试。
 
 ---
 
-## 快速上手（无需任何驱动）
+## 快速上手
 
 ```bash
-# 1. 生成示例库（Roads 独立要素类 / OwnerTable 独立表 / Hydrology\Ponds 数据集内要素类）
-cargo run --example make_sample -- examples/sample.mdb.json
+# 1. 遍历（独立要素类 + 独立表 + 要素数据集 + 数据集内要素类）
+cargo run --example traverse -- 你的库.mdb
 
-# 2. 遍历（独立要素类 + 独立表 + 要素数据集 + 数据集内要素类）
-cargo run --example traverse
+# 2. 属性与几何更新（需读写权限；含 WritePolicy 自动维护的一致性数据）
+cargo run --example update -- 你的库.mdb
 
-# 3. 属性与几何更新（含 WritePolicy 自动维护的一致性数据）
-cargo run --example update
-
-# 4. Shape 二进制布局演示
+# 3. Shape 二进制布局演示（无需驱动）
 cargo run --example shape_codec
 ```
 
@@ -102,7 +134,7 @@ cargo run --example shape_codec
 
 ```bash
 pgdb-cli <数据源> <子命令> [选项]
-# 数据源可以是 *.mdb（需 odbc feature），也可以是 *.json 镜像
+# 数据源为真实 *.mdb（需 odbc feature 与驱动）
 ```
 
 | 子命令 | 作用 | 主要选项 |
@@ -120,31 +152,30 @@ pgdb-cli <数据源> <子命令> [选项]
 | `create-row <ds>` | 新建属性行 | `--set FIELD=VALUE` |
 | `delete-rows <ds>` | 删除行 | `--oid` `--where` `--yes` |
 | `rebuild-index <fc>` | 重建 `<表>_SHAPE_Index` 并重算图层范围 | – |
-| `sql <stmt>` | 原始 SQL（镜像后端降级为只读表扫描） | – |
-| `export-mirror` | 导出为本地 JSON 镜像（离线快照，含所有 `GDB_*` 元数据） | `--output`、`--include-system` |
+| `sql <stmt>` | 原始 SQL（仅 ODBC 后端可用） | – |
 
 数据集名支持 ArcMap 风格的限定名：`Hydrology\Ponds`。
 
 示例：
 
 ```bash
-pgdb-cli sample.mdb.json tree
+pgdb-cli 你的库.mdb tree
 # 要素类      Roads（几何类型：线），2 行
 # 表          OwnerTable，2 行
 # 要素数据集  Hydrology（含 1 个要素类）
 #     要素类      Hydrology\Ponds（几何类型：面），2 行
 
-pgdb-cli sample.mdb.json update-attr Roads --oid 1 --set NAME=长安街
-pgdb-cli sample.mdb.json set-geometry Roads --oid 2 --wkt 'LINESTRING(20 20, 30 30)'
-pgdb-cli sample.mdb.json create-feature 'Hydrology\Ponds' \
+pgdb-cli 你的库.mdb update-attr Roads --oid 1 --set NAME=长安街
+pgdb-cli 你的库.mdb set-geometry Roads --oid 2 --wkt 'LINESTRING(20 20, 30 30)'
+pgdb-cli 你的库.mdb create-feature 'Hydrology\Ponds' \
     --wkt 'POLYGON((10 10, 10 12, 12 12, 12 10, 10 10))' --set NAME=池塘C
-pgdb-cli sample.mdb.json export-wkt 'Hydrology\Ponds'
+pgdb-cli 你的库.mdb export-wkt 'Hydrology\Ponds'
 ```
 
 打开真实 mdb：
 
 ```bash
-cargo build --features odbc
+cargo build
 ./target/debug/pgdb-cli 你的库.mdb tree
 ./target/debug/pgdb-cli 你的库.mdb drivers   # 排查驱动
 ```
@@ -242,13 +273,13 @@ insert.flush()?;
 | `shape_index_suffix` | `_SHAPE_Index` | 空间索引表后缀 |
 
 ```rust
-use pgdb::gdb::{AccessWorkspaceFactory, WritePolicy, WorkspaceOptions};
+use pgdb::gdb::{AccessWorkspaceFactory, WritePolicy};
 
 let policy = WritePolicy { maintain_shape_index: false, ..WritePolicy::default() };
-let ws = AccessWorkspaceFactory.open_mirror_with_options(
-    "sample.mdb.json",
-    WorkspaceOptions { write_policy: policy, ..Default::default() },
-)?;
+// 真实 mdb 直接走 ODBC 后端；写策略在打开后通过工作空间选项生效
+// 只读探查走 jetdb（无需驱动）；需要写入时改成 AccessMode::ReadWrite（走 ODBC）
+let ws = AccessWorkspaceFactory::open_with_mode("你的库.mdb", AccessMode::ReadOnly, None)?;
+// policy 可用于后续更新时控制是否维护空间索引等一致性数据
 ```
 
 > 为什么必须维护 `_SHAPE_Index`：ArcMap/ArcGIS Pro 定位与选中要素依赖这套网格记录，缺更新会出现"属性表里有值、地图里选不中/缩放到图层失败"的现象。
@@ -336,37 +367,16 @@ GDB_FieldInfo        TableName / FieldName / AliasName（字段别名）
 
 ---
 
-## JSON 镜像后端
+## 内存镜像后端
 
-结构：
+`mirror` 模块提供一个纯内存的 `MirrorBackend`（**不落盘、不涉及任何 JSON 序列化**）。
 
-```jsonc
-{
-  "version": 1,
-  "source": "原始 mdb 路径",
-  "tables": [
-    { "name": "Roads",
-      "columns": [ { "name": "OBJECTID", "sql_type": "LONG", "is_auto": true }, ... ],
-      "rows": [ [ {"t":"I64","v":1}, {"t":"Text","v":"G1"}, {"t":"Binary","v":"03000000..."} ] ],
-      "next_auto": 3 }
-  ]
-}
-```
+用途：① 单元测试 / 集成测试里充当确定性的数据源，无需任何 ODBC 驱动即可演练目录遍历、
+要素更新、Shape 二进制读写等全部逻辑；② 作为 `SqlBackend` 的一种实现，与 ODBC 后端共享上层的
+目录 / 游标逻辑。
 
-二进制以十六进制字符串存储，其余值按标签保留原始类型。
-
-**生成 / 使用**：
-
-```bash
-# 从真实 mdb 导出（需要 odbc feature 与驱动；Linux 只读驱动同样可以导出）
-pgdb-cli 你的库.mdb export-mirror --output snapshot.mdb.json
-# 之后所有命令都能脱离驱动，直接操作镜像
-pgdb-cli snapshot.mdb.json tree
-pgdb-cli snapshot.mdb.json export-wkt Roads
-```
-
-用途：① 无驱动环境下的开发与演示；② 单元测试的确定性数据源；③ 现场库的离线快照与差异对比。
-镜像是**数据副本**而非 Access 文件本身，本库目前不提供把镜像回写成 `.mdb` 的能力。
+所有数据都保存在进程内存中；要持久化到磁盘，请直接对真实 `*.mdb` 使用 ODBC 后端。本库不提供
+把内存镜像另存为 `.mdb` 或 JSON 的能力——查询 / 更新 / 删除只面向真实的 Personal Geodatabase。
 
 ---
 
@@ -399,7 +409,7 @@ cargo test
 # Linux 安装只读驱动；Windows 安装 Access Database Engine
 sudo apt install unixodbc odbc-mdbtools gdal-bin
 
-cargo test --features odbc --test test_mdb -- --ignored --test-threads=1
+cargo test --test test_mdb -- --ignored --test-threads=1
 ```
 
 9 个用例分别是：工作空间信息、三类数据集遍历、中文名称查找、要素类结构、
@@ -612,7 +622,7 @@ sudo apt install unixodbc odbc-mdbtools gdal-bin
 # 运行（含 GDAL ogrinfo 交叉验证；写回测试在只读驱动下自动跳过）
 PGDB_TEST_MDB=/tmp/sample_legacy.mdb \
 PGDB_TEST_MDB_ITEMS=/tmp/sample_items.mdb \
-    cargo test --features odbc --test odbc_real -- --ignored --test-threads=1
+    cargo test --test odbc_real -- --ignored --test-threads=1
 ```
 
 ---

@@ -26,11 +26,11 @@ registry = "sparse+https://rsproxy.cn/index/"
 :: 解压 pgdb-rs-src.zip 后进入目录
 cd pgdb-rs
 
-:: 默认（JSON 镜像后端，无任何驱动依赖）
+:: 默认（仅内存后端，CLI 仍需 ODBC 才能打开真实 mdb）
 cargo build --release
 
 :: 完整版（ODBC 直连真实 mdb，推荐）
-cargo build --release --features odbc
+cargo build --release
 
 :: 产物
 target\release\pgdb-cli.exe
@@ -40,7 +40,7 @@ target\release\pgdb-cli.exe
 
 ```bat
 rustup target add i686-pc-windows-msvc
-cargo build --release --features odbc --target i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc
 ```
 
 ## 3. 安装 Access 驱动（关键）
@@ -88,20 +88,20 @@ pgdb-cli.exe D:\data\你的库.mdb tree
 
 ```bat
 cargo test
-cargo test --features odbc
+cargo test
 
 :: 基准库验收测试：以 tests\fixtures\test.mdb 为基准（ArcGIS 10.1 / GDB_Items 模型，
 :: 含中文要素数据集 BDC不动产、中文要素类 界址点/其他、中文表 附加，共 9 个用例）
-cargo test --features odbc --test test_mdb -- --ignored --test-threads=1
+cargo test --test test_mdb -- --ignored --test-threads=1
 
 :: 换用其它基准文件
 set PGDB_TEST_MDB=D:\data\你的库.mdb
-cargo test --features odbc --test test_mdb -- --ignored --test-threads=1
+cargo test --test test_mdb -- --ignored --test-threads=1
 
 :: 上一轮 Jackcess 样本库的集成测试
 set PGDB_TEST_MDB=D:\tmp\sample_legacy.mdb
 set PGDB_TEST_MDB_ITEMS=D:\tmp\sample_items.mdb
-cargo test --features odbc --test odbc_real -- --ignored --test-threads=1
+cargo test --test odbc_real -- --ignored --test-threads=1
 ```
 
 在 Windows + ACE 驱动下，`test_mdb.rs` 中的**写回往返用例会真正执行**
@@ -198,7 +198,7 @@ pgdb-cli.exe D:\数据\test.mdb tree
 | 属性改了但 ArcMap 里选不中要素 | 空间索引未同步；执行 `rebuild-index <要素类>`（正常写入路径会自动维护） |
 | 中文乱码 | 本库已自动切 UTF-8 控制台并桥接代码页；若仍异常见 §7.1/§7.2 |
 | 中文显示为方块 `□□□` | 字体缺字形（非编码问题）；换 Windows Terminal 或 `NSimSun` 字体 |
-| 打开提示"未编译 odbc feature" | 加 `--features odbc` 重新编译 |
+| 提示缺少 ODBC 驱动 | 安装 Microsoft Access Database Engine；仅做查询可改用 `--access readonly`（纯 Rust，无需驱动） |
 | 中文表名报 `找不到表 / Couldn't parse SQL` | 需用 `[]` 或 `""` 引用中文标识符（mdbtools 不接受反引号）；本库内部已自动处理 |
 
 ### 关于 `42000 / 22003` 这两个报错

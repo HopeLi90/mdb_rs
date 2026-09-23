@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::datastore::SqlBackend;
+use crate::datastore::{AccessMode, SqlBackend};
 use crate::error::Result;
 
 use super::workspace::{AccessWorkspace, FeatureWorkspace, WorkspaceOptions};
@@ -41,7 +41,7 @@ impl AccessWorkspaceFactory {
             .any(|w| w == JET4_SIGNATURE)
     }
 
-    /// 由已有后端（ODBC / 镜像）构造工作空间
+    /// 由已有后端（ODBC / jetdb / 内存镜像）构造工作空间
     pub fn open_from_backend(
         backend: Arc<dyn SqlBackend>,
         path: impl Into<String>,
@@ -53,37 +53,47 @@ impl AccessWorkspaceFactory {
         }
     }
 
-    /// 直接打开本地镜像文件（无需任何数据库驱动）
-    pub fn open_mirror(path: &str) -> Result<AccessWorkspace> {
-        let backend = Arc::new(crate::datastore::mirror::MirrorBackend::open_file(path)?);
-        Self::open_from_backend(backend, path, None)
+    /// 以指定**读写权限**打开 `.mdb` / `.accdb`。
+    ///
+    /// 这是推荐的入口：由 [`AccessMode`] 在运行时决定用哪种解析方式，
+    /// 因此同一个可执行文件同时支持两条路径，无需在编译期挑选 feature。
+    ///
+    /// - [`AccessMode::ReadOnly`]：纯 Rust 的 jetdb 解析，无需任何驱动、跨平台，仅可查询；
+    /// - [`AccessMode::ReadWrite`]：ODBC 驱动解析，可读写（Windows 需安装与程序位数
+    ///   匹配的 Access/ACE 驱动；Linux 下的 MDBTools 驱动本身为只读）。
+    pub fn open_with_mode(
+        path: &str,
+        mode: AccessMode,
+        options: Option<WorkspaceOptions>,
+    ) -> Result<AccessWorkspace> {
+        let opts = WorkspaceOptions {
+            access_mode: mode,
+            ..options.unwrap_or_default()
+        };
+        let backend = crate::datastore::open_backend(path, opts.access_mode, None)?;
+        let backend: Arc<dyn SqlBackend> = Arc::from(backend);
+        Self::open_from_backend(backend, path, Some(opts))
     }
 
-    /// 打开本地镜像文件并使用指定选项
-    pub fn open_mirror_with_options(path: &str, options: WorkspaceOptions) -> Result<AccessWorkspace> {
-        let backend = Arc::new(crate::datastore::mirror::MirrorBackend::open_file(path)?);
-        Self::open_from_backend(backend, path, Some(options))
-    }
-
-    /// 打开 ODBC 数据源把?.mdb 作为个人地理数据库访问
+    /// 打开 ODBC 数据源把 `.mdb` 作为个人地理数据库访问（读写）
     ///
     /// Windows 使用 `Driver={Microsoft Access Driver (*.mdb)}`，Linux 可用只读的
     /// MDBTools 驱动。写操作需要 Windows + ACE/Jet 驱动。
-    #[cfg(feature = "odbc")]
     pub fn open_odbc(path: &str, connection_string: Option<&str>) -> Result<AccessWorkspace> {
         let backend = Arc::new(crate::datastore::odbc::OdbcBackend::connect(
             path,
             connection_string,
         )?);
-        Self::open_from_backend(backend, path, None)
+        let opts = WorkspaceOptions {
+            access_mode: AccessMode::ReadWrite,
+            ..Default::default()
+        };
+        Self::open_from_backend(backend, path, Some(opts))
     }
 
-    /// 未启用 odbc feature 时的占位实现，用于给出明确错误提示
-    #[cfg(not(feature = "odbc"))]
-    pub fn open_odbc(_path: &str, _connection_string: Option<&str>) -> Result<AccessWorkspace> {
-        Err(crate::error::PgdbError::Unsupported(
-            "未编译 'odbc' feature，请 cargo build --features odbc 后重试".into(),
-        ))
+    /// 以**只读**权限打开：使用纯 Rust 的 jetdb 解析，无需任何驱动、跨平台。
+    pub fn open_read_only(path: &str) -> Result<AccessWorkspace> {
+        Self::open_with_mode(path, AccessMode::ReadOnly, None)
     }
 }
 
@@ -102,26 +112,36 @@ impl WorkspaceFactory for AccessWorkspaceFactory {
     }
 
     fn open(&self, path: &str, options: Option<WorkspaceOptions>) -> Result<AccessWorkspace> {
-        let is_json = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            == Some("json");
-        if is_json {
-            return match options {
-                Some(o) => Self::open_mirror_with_options(path, o),
-                None => Self::open_mirror(path),
-            };
-        }
-        let backend = crate::datastore::odbc_backend(path, None)?;
+        // 按 `WorkspaceOptions::access_mode` 选择后端：只读 -> jetdb（纯 Rust，无驱动）；
+        // 读写 -> ODBC（需安装与程序位数匹配的 Access/ACE 驱动）。
+        // 未显式给选项时按默认权限（读写）打开。
+        let opts = options.unwrap_or_default();
+        let backend = crate::datastore::open_backend(path, opts.access_mode, None)?;
         let backend: Arc<dyn SqlBackend> = Arc::from(backend);
-        Self::open_from_backend(backend, path, options)
+        Self::open_from_backend(backend, path, Some(opts))
     }
 }
 
-/// 便捷打开函数：按路径自动选择后端
-pub fn open_workspace(path: &str) -> Result<AccessWorkspace> {
-    let factory = AccessWorkspaceFactory;
-    factory.open(path, None)
+/// 便捷打开函数：按指定**读写权限**打开工作空间。
+///
+/// ```rust,no_run
+/// use pgdb::gdb::{open_workspace, AccessMode};
+///
+/// # fn demo() -> pgdb::Result<()> {
+/// // 只读：纯 Rust jetdb，无需任何驱动
+/// let ws = open_workspace("sample.mdb", AccessMode::ReadOnly)?;
+/// // 读写：ODBC，需安装与程序位数匹配的 Access/ACE 驱动
+/// let rw = open_workspace("sample.mdb", AccessMode::ReadWrite)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn open_workspace(path: &str, mode: AccessMode) -> Result<AccessWorkspace> {
+    AccessWorkspaceFactory::open_with_mode(path, mode, None)
+}
+
+/// 便捷打开函数：以只读权限打开（jetdb，无驱动依赖）
+pub fn open_workspace_read_only(path: &str) -> Result<AccessWorkspace> {
+    open_workspace(path, AccessMode::ReadOnly)
 }
 
 /// 便捷函数：判断某个要素类是否存在

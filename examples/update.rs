@@ -8,12 +8,12 @@
 //! 3. **新建要素**（`IFeatureClass::Insert` + `IFeatureBuffer`）与删除
 //! 4. 写完后回读校验 ESRI 依赖的一致性数据
 //!
-//! 为避免污染示例数据，脚本会把示例镜像复制一份临时副本再操作。
+//! 为避免污染源数据，脚本会把 `*.mdb` 复制一份临时副本再操作（需要 `odbc` feature 与驱动）。
 //!
 //! 运行：
 //!
 //! ```bash
-//! cargo run --example update
+//! cargo run --example update -- 你的库.mdb
 //! ```
 
 use pgdb::datastore::Predicate;
@@ -30,10 +30,10 @@ fn main() -> pgdb::Result<()> {
     // ---------- 准备一份可写的临时副本 ----------
     let src = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "examples/sample.mdb.json".to_string());
+        .unwrap_or_else(|| "你的库.mdb".to_string());
     let dir = std::env::temp_dir().join("pgdb-rs-demo");
     std::fs::create_dir_all(&dir).ok();
-    let work = dir.join("sample-copy.mdb.json");
+    let work = dir.join("sample-copy.mdb");
     std::fs::copy(&src, &work).map_err(|e| {
         pgdb::PgdbError::io(format!("复制 {} -> {}", src, work.display()), e)
     })?;

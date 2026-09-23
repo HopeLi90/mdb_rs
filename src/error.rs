@@ -57,9 +57,9 @@ pub enum PgdbError {
     #[error("无效参数: {0}")]
     InvalidArgument(String),
 
-    /// 序列化错误（镜像文件读写）
-    #[error("序列化错误: {0}")]
-    Serialize(String),
+    /// 工作空间为只读，不允许写入操作
+    #[error("只读工作空间，不支持写入: {0}")]
+    ReadOnly(String),
 
     /// 多个错误聚合（例如批量刷新游标时的部分失败）
     #[error("批处理中 {0} 项失败: {1}")]
@@ -88,6 +88,11 @@ impl PgdbError {
     /// 构造“对象不存在”错误。
     pub fn not_found<S: Into<String>>(name: S) -> Self {
         PgdbError::NotFound(name.into())
+    }
+
+    /// 构造“只读工作空间”错误。
+    pub fn read_only<S: Into<String>>(msg: S) -> Self {
+        PgdbError::ReadOnly(msg.into())
     }
 }
 

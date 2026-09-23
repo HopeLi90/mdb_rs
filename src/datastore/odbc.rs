@@ -415,7 +415,7 @@ fn driver_troubleshooting() -> String {
             .to_string()
     } else {
         "排查建议：Linux/macOS 下 mdbtools 的 ODBC 驱动为只读且不支持写，\n\
-         如需读写请使用 Windows + Access Database Engine，或用 `--features` 之外的 JSON 镜像后端演练逻辑。"
+         如需读写请使用 Windows + Access Database Engine 驱动。"
             .to_string()
     }
 }

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::datastore::{DataTableRow, SqlBackend};
+use crate::datastore::{AccessMode, DataTableRow, SqlBackend};
 use crate::error::{PgdbError, Result};
 use crate::value::Value;
 
@@ -27,6 +27,8 @@ use super::table::{PgdbTable, Table};
 /// 工作空间打开选项
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceOptions {
+    /// 访问权限：只读（jetdb）或读写（ODBC）。默认读写。
+    pub access_mode: AccessMode,
     /// 几何写入策略
     pub write_policy: WritePolicy,
     /// 是否在打开时立即构造所有要素数据集的子数据集
@@ -174,6 +176,22 @@ pub trait Workspace {
 
     /// 工作空间选项
     fn options(&self) -> &WorkspaceOptions;
+
+    /// 访问权限（只读 / 读写），对应 ArcObjects 中工作空间「是否可编辑」的概念
+    fn access_mode(&self) -> AccessMode {
+        self.options().access_mode
+    }
+
+    /// 是否为只读工作空间（请求了只读权限即视为只读）
+    fn is_read_only(&self) -> bool {
+        self.access_mode() == AccessMode::ReadOnly
+    }
+
+    /// 是否真正可写：既请求了读写权限，后端又具备写能力
+    /// （Linux 下 ODBC 走 MDBTools 驱动时为只读，因此即使请求读写也返回 false）
+    fn can_write(&self) -> bool {
+        !self.is_read_only() && self.backend().capabilities().writable
+    }
 
     /// 顶层数据集（`IWorkspace::get_Datasets`）
     fn datasets(&self) -> Result<DatasetEnum>;

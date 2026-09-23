@@ -17,13 +17,12 @@
 //! ```bash
 //! # Windows：安装 Microsoft Access Database Engine（ACE）或 Jet 4 驱动
 //! # Linux  ：sudo apt install unixodbc odbc-mdbtools   （只读）
-//! cargo test --features odbc --test test_mdb -- --ignored --test-threads=1
+//! cargo test --test test_mdb -- --ignored --test-threads=1
 //! ```
 //!
 //! 未安装 ODBC 驱动时，各用例打印提示并**自动跳过**（不会误报失败）。
 //! 如需换文件，设置环境变量 `PGDB_TEST_MDB=<路径>` 覆盖夹具路径。
 
-#![cfg(feature = "odbc")]
 
 use std::path::PathBuf;
 

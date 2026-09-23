@@ -12,13 +12,12 @@
 //! ```bash
 //! PGDB_TEST_MDB=/tmp/sample_legacy.mdb \
 //! PGDB_TEST_MDB_ITEMS=/tmp/sample_items.mdb \
-//!     cargo test --features odbc --test odbc_real -- --ignored --test-threads=1
+//!     cargo test --test odbc_real -- --ignored --test-threads=1
 //! ```
 //!
 //! 未设置环境变量时各用例自动跳过；写回测试会把 mdb **复制到临时目录**再改，
 //! 不会碰原始文件；在只读驱动（mdbtools）下写回用例打印提示后跳过。
 
-#![cfg(feature = "odbc")]
 
 use pgdb::gdb::{
     AccessWorkspaceFactory, DatasetKind, FeatureClass, FeatureDataset, FeatureWorkspace,

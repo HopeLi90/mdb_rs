@@ -13,7 +13,10 @@ pub mod workspace;
 
 pub use cursor::{FeatureIter, InsertFeatureCursor, InsertRowCursor, RowIter};
 pub use dataset::DatasetNode;
-pub use factory::{AccessWorkspaceFactory, WorkspaceFactory};
+pub use factory::{
+    contains_feature_class, open_workspace, open_workspace_read_only, AccessWorkspaceFactory,
+    WorkspaceFactory,
+};
 pub use featureclass::{FeatureClass, PgdbFeatureClass, WritePolicy};
 pub use featuredataset::{FeatureDataset, PgdbFeatureDataset};
 pub use filter::{QueryFilter, SpatialFilter, SpatialRel};
@@ -27,4 +30,5 @@ pub use workspace::{
     AccessWorkspace, DatasetEnum, DatasetHandle, FeatureWorkspace, Workspace, WorkspaceOptions,
 };
 
+pub use crate::datastore::AccessMode;
 pub use crate::value::{SqlValue, Value};

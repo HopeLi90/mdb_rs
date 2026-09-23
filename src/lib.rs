@@ -12,20 +12,32 @@
 //! - 写几何时自动维护 ESRI 依赖的一致性数据：`Shape_Length` / `Shape_Area`、
 //!   `<业务表>_SHAPE_Index` 网格记录、`GDB_GeomColumns` 图层范围
 //!
+//! ## 两种解析后端：由「读写权限」在运行时决定
+//!
+//! 库内同时内置两条解析路径，**不需要在编译期挑选 feature**，由打开时的
+//! [`gdb::AccessMode`] 决定走哪条：
+//!
+//! | 读写权限 | 后端 | 是否需要驱动 | 能力 |
+//! |----------|------|--------------|------|
+//! | [`AccessMode::ReadOnly`] | 纯 Rust 的 `jetdb` | **不需要**，跨平台（含 WASM） | 仅查询 |
+//! | [`AccessMode::ReadWrite`] | `ODBC` | 需要与程序位数匹配的 Access/ACE 驱动 | 查询 + 写入 |
+//!
+//! 因此常见用法是：**只想看数据**就用只读模式（零依赖、随处可跑）；
+//! **需要改数据**再用读写模式（在 Windows 上装好 ACE 驱动）。
+//!
 //! ## 快速示例
 //!
 //! ### 遍历：独立要素类 / 独立表 / 要素数据集内部的要素类
 //!
 //! ```rust,no_run
 //! use pgdb::gdb::{
-//!     DatasetNode, FeatureDataset, FeatureWorkspace, Workspace, WorkspaceFactory,
-//!     AccessWorkspaceFactory,
+//!     AccessMode, AccessWorkspaceFactory, DatasetNode, FeatureDataset, FeatureWorkspace,
+//!     Workspace, WorkspaceFactory,
 //! };
 //!
 //! # fn demo() -> pgdb::Result<()> {
-//! // 真实 *.mdb 用 open_odbc（Windows + ACE 驱动）：
-//! // let ws = AccessWorkspaceFactory::open_odbc("sample.mdb", None)?;
-//! let ws = AccessWorkspaceFactory::open_mirror("sample.mdb.json")?;
+//! // 只读探查：纯 Rust 解析，无需安装任何驱动
+//! let ws = AccessWorkspaceFactory::open_with_mode("sample.mdb", AccessMode::ReadOnly, None)?;
 //!
 //! // IWorkspace::get_Datasets —— 顶层数据集枚举
 //! let mut enum_ds = ws.datasets()?;
@@ -44,13 +56,17 @@
 //!
 //! ### 更新：属性与几何（`IFeature::Store` 语义）
 //!
+//! 写入必须用**读写权限**打开（走 ODBC）：
+//!
 //! ```rust,no_run
-//! use pgdb::gdb::{FeatureClass, FeatureWorkspace, QueryFilter, Table, WorkspaceFactory};
-//! use pgdb::gdb::AccessWorkspaceFactory;
+//! use pgdb::gdb::{
+//!     AccessMode, AccessWorkspaceFactory, FeatureClass, FeatureWorkspace, QueryFilter, Table,
+//!     WorkspaceFactory,
+//! };
 //! use pgdb::{Geometry, Value};
 //!
 //! # fn demo() -> pgdb::Result<()> {
-//! let ws = AccessWorkspaceFactory::open_mirror("sample.mdb.json")?;
+//! let ws = AccessWorkspaceFactory::open_with_mode("sample.mdb", AccessMode::ReadWrite, None)?;
 //!
 //! // 数据集内的要素类用限定名：`数据集\要素类`
 //! let fc = ws.open_feature_class("Hydrology\\Ponds")?;

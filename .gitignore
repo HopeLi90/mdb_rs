@@ -1,1 +1,15 @@
+# 编译产物
 /target
+
+# 发行与生成物（含 Windows exe 与样例 mdb）
+/dist
+*.exe
+
+# Java 编译产物
+*.class
+
+# 编辑器 / 系统
+.idea
+.vscode
+*.swp
+.DS_Store

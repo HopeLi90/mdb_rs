@@ -14,17 +14,21 @@
 //! | `delete-rows` | `ITable::DeleteSearchedRows` |
 //! | `rebuild-index` | 维护 `<表>_SHAPE_Index` 与 `GDB_GeomColumns` |
 //!
-//! 数据源可以是真实 `*.mdb`（需要 `odbc` feature 与驱动），
-//! 也可以是 JSON 镜像文件（`*.json`，无驱动依赖）。
+//! 数据源为真实 `*.mdb` / `*.accdb`，由 `--access` 指定**读写权限**，
+//! 权限决定使用哪种解析方式：
+//! - `--access readonly`（或 `--read-only`）：纯 Rust 的 **jetdb** 解析，
+//!   无需任何驱动、跨平台，仅支持查询；
+//! - `--access readwrite`（默认）：**ODBC** 驱动解析，支持读写，
+//!   需要安装与程序位数匹配的 Access/ACE 驱动。
 
 use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
 
 use pgdb::gdb::{
-    AccessWorkspace, AccessWorkspaceFactory, DatasetHandle, DatasetKind, FeatureClass,
+    AccessMode, AccessWorkspace, AccessWorkspaceFactory, DatasetHandle, DatasetKind, FeatureClass,
     FeatureWorkspace, InsertFeatureCursor, MetadataModel, QueryFilter, SpatialReference, Table,
-    Workspace, WorkspaceFactory,
+    Workspace,
 };
 use pgdb::geom::{geometry_from_wkt, AsWkt, Geometry};
 use pgdb::{pad_display, Field, FieldType, Fields, PgdbError, Result, Value};
@@ -49,11 +53,23 @@ fn main() {
     about = "ESRI Personal Geodatabase (*.mdb) 解析与管理工具"
 )]
 struct Cli {
-    /// 数据源路径：`*.mdb` 走 ODBC 驱动，`*.json` 走本地镜像
+    /// 读写权限：`readonly` 用纯 Rust 的 jetdb 解析（仅查询、无需驱动）；
+    /// `readwrite` 用 ODBC 驱动解析（可写，需匹配位数的 Access/ACE 驱动）
+    #[arg(long, value_name = "MODE", value_parser = parse_access_mode, global = true)]
+    access: Option<AccessMode>,
+    /// 等价于 `--access readonly`（保留的简写形式）
+    #[arg(long, global = true, conflicts_with = "access")]
+    read_only: bool,
+    /// 数据源路径（真实 `*.mdb` / `*.accdb`）
     database: String,
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// 解析 `--access` 的取值，把 clap 的报错转成项目统一错误文案
+fn parse_access_mode(s: &str) -> std::result::Result<AccessMode, String> {
+    s.parse::<AccessMode>().map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,15 +118,6 @@ enum Command {
         /// SQL 语句
         statement: String,
     },
-    /// 把数据源完整导出为本地 JSON 镜像文件（离线快照 / 无驱动环境演练）
-    ExportMirror {
-        /// 输出文件路径，例如 `snapshot.mdb.json`
-        #[arg(long, value_name = "FILE")]
-        output: String,
-        /// 是否同时导出 Access 系统表（`MSys*`）
-        #[arg(long)]
-        include_system: bool,
-    },
 }
 
 /// 过滤条件参数（多个子命令共用）
@@ -119,7 +126,7 @@ struct FilterArgs {
     /// 按 OBJECTID 精确过滤（所有后端都支持）
     #[arg(long, value_name = "OID")]
     oid: Option<i64>,
-    /// WHERE 子句（不含 WHERE 关键字）。镜像后端不支持原生 WHERE，会自动降级为内存过滤
+    /// WHERE 子句（不含 WHERE 关键字）。ODBC 后端直接下推；其它后端会降级为内存过滤
     #[arg(long = "where", value_name = "CLAUSE")]
     where_clause: Option<String>,
 }
@@ -230,7 +237,15 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Drivers = cli.command {
         return cmd_drivers();
     }
-    let ws = open_workspace(&cli.database)?;
+    // 由 `--access`（或简写 `--read-only`）解析出读写权限，权限决定解析后端
+    let mode = cli
+        .access
+        .unwrap_or(if cli.read_only {
+            AccessMode::ReadOnly
+        } else {
+            AccessMode::ReadWrite
+        });
+    let ws = open_workspace(&cli.database, mode)?;
     match cli.command {
         Command::Drivers => unreachable!("已在上方处理"),
         Command::Info => cmd_info(&ws),
@@ -249,89 +264,67 @@ fn run(cli: Cli) -> Result<()> {
         Command::DeleteRows(args) => cmd_delete_rows(&ws, &args),
         Command::RebuildIndex { dataset } => cmd_rebuild_index(&ws, &dataset),
         Command::Sql { statement } => cmd_sql(&ws, &statement),
-        Command::ExportMirror {
-            output,
-            include_system,
-        } => cmd_export_mirror(&ws, &output, include_system),
     }
 }
 
-/// 导出为本地镜像：把后端里的每张表（含 GDB_* 元数据）原样复制到 JSON 文件
-fn cmd_export_mirror(ws: &AccessWorkspace, output: &str, include_system: bool) -> Result<()> {
-    use pgdb::datastore::{mirror::MirrorBackend, Predicate, SqlBackend};
-
-    let source = ws.backend();
-    let target = MirrorBackend::new();
-    let mut tables = 0usize;
-    let mut rows_total = 0usize;
-    for name in source.table_names()? {
-        if !include_system && (name.starts_with("MSys") || name.starts_with("~TMP")) {
-            continue;
-        }
-        let cols = source.columns(&name)?;
-        target.create_table(&name, cols)?;
-        let rows = source.select(&name, &[], &Predicate::All)?;
-        let mut inserted = 0usize;
-        for row in &rows {
-            target.insert(&name, &row.pairs())?;
-            inserted += 1;
-        }
-        rows_total += inserted;
-        tables += 1;
-        println!("  {name}: {inserted} 行");
-    }
-    target.save_file(output)?;
-    println!("已导出 {tables} 张表、共 {rows_total} 行 -> {output}");
-    Ok(())
-}
-
-fn open_workspace(path: &str) -> Result<AccessWorkspace> {
+/// 按读写权限打开工作空间：权限枚举直接决定后端（jetdb / ODBC），
+/// 不再依赖编译期的 feature 开关。
+fn open_workspace(path: &str, mode: AccessMode) -> Result<AccessWorkspace> {
     if !Path::new(path).exists() {
         return Err(PgdbError::InvalidArgument(format!("数据源不存在: {path}")));
     }
-    AccessWorkspaceFactory.open(path, None)
+    AccessWorkspaceFactory::open_with_mode(path, mode, None)
+}
+
+/// 写操作前的权限/能力检查（对标 ArcEngine 的 `IWorkspaceEdit` 编辑约束）
+fn ensure_writable(ws: &AccessWorkspace) -> Result<()> {
+    if ws.can_write() {
+        Ok(())
+    } else if ws.is_read_only() {
+        Err(PgdbError::read_only(
+            "当前以只读权限打开（jetdb 后端），不支持写入；如需写入，请改用 \
+             `--access readwrite`（ODBC 后端，需安装与程序位数匹配的 Access/ACE 驱动）",
+        ))
+    } else {
+        Err(PgdbError::read_only(
+            "当前后端的驱动本身为只读（例如 Linux 下的 MDBTools 驱动），不支持写入；\
+             请使用 Windows + Microsoft Access Database Engine 驱动",
+        ))
+    }
 }
 
 // ------------------------------------------------------------------ 查询类
 
 /// 列出系统里登记的 ODBC 驱动与 DSN，用于排查"驱动没装 / 位数不匹配"
 fn cmd_drivers() -> Result<()> {
-    #[cfg(feature = "odbc")]
-    {
-        let probe = pgdb::datastore::odbc::probe_drivers();
-        println!("已登记的 ODBC 驱动：");
-        if probe.installed.is_empty() {
-            println!("  （无）");
-        }
-        for d in &probe.installed {
-            let tag = if probe.access_drivers.contains(d) {
-                "   [可用于 mdb]"
-            } else {
-                ""
-            };
-            println!("  - {d}{tag}");
-        }
-        println!();
-        println!("用户/系统 DSN：");
-        if probe.data_sources.is_empty() {
-            println!("  （无）");
-        }
-        for d in &probe.data_sources {
-            println!("  - {d}");
-        }
-        println!();
-        if probe.access_drivers.is_empty() {
-            println!("未找到 Access 驱动：请安装 Microsoft Access Database Engine Redistributable，");
-            println!("并确保驱动位数与程序位数一致（64 位程序需要 64 位 ACE）。");
-        }
-        Ok(())
+    let probe = pgdb::datastore::odbc::probe_drivers();
+    println!("已登记的 ODBC 驱动：");
+    if probe.installed.is_empty() {
+        println!("  （无）");
     }
-    #[cfg(not(feature = "odbc"))]
-    {
-        Err(PgdbError::Unsupported(
-            "未编译 'odbc' feature，请 cargo build --features odbc 后重试".into(),
-        ))
+    for d in &probe.installed {
+        let tag = if probe.access_drivers.contains(d) {
+            "   [可用于 mdb]"
+        } else {
+            ""
+        };
+        println!("  - {d}{tag}");
     }
+    println!();
+    println!("用户/系统 DSN：");
+    if probe.data_sources.is_empty() {
+        println!("  （无）");
+    }
+    for d in &probe.data_sources {
+        println!("  - {d}");
+    }
+    println!();
+    if probe.access_drivers.is_empty() {
+        println!("未找到 Access 驱动：请安装 Microsoft Access Database Engine Redistributable，");
+        println!("并确保驱动位数与程序位数一致（64 位程序需要 64 位 ACE）。");
+        println!("提示：仅做查询时可用 `--access readonly`，走纯 Rust 的 jetdb 后端，无需任何驱动。");
+    }
+    Ok(())
 }
 
 fn cmd_info(ws: &AccessWorkspace) -> Result<()> {
@@ -339,6 +332,11 @@ fn cmd_info(ws: &AccessWorkspace) -> Result<()> {
     let catalog = ws.catalog();
     println!("数据源        : {}", ws.path());
     println!("后端          : {}", ws.backend().kind());
+    println!(
+        "读写权限      : {}（{}）",
+        ws.access_mode(),
+        if ws.is_read_only() { "只读" } else { "读写" }
+    );
     println!(
         "可写/事务/SQL : {} / {} / {}",
         bool_cn(caps.writable),
@@ -523,6 +521,7 @@ fn cmd_export_wkt(ws: &AccessWorkspace, args: &ExportWktArgs) -> Result<()> {
 // ------------------------------------------------------------------ 写入类
 
 fn cmd_update_attr(ws: &AccessWorkspace, args: &UpdateAttrArgs) -> Result<()> {
+    ensure_writable(ws)?;
     let handle = ws.open_dataset(&args.dataset)?;
     let Some(table) = handle.as_table() else {
         return Err(PgdbError::Unsupported(format!(
@@ -549,6 +548,7 @@ fn cmd_update_attr(ws: &AccessWorkspace, args: &UpdateAttrArgs) -> Result<()> {
 }
 
 fn cmd_set_geometry(ws: &AccessWorkspace, args: &SetGeometryArgs) -> Result<()> {
+    ensure_writable(ws)?;
     let fc = ws.open_feature_class(&args.dataset)?;
     let geometries = read_wkt_sources(&args.wkt, &args.wkt_file)?;
     if geometries.is_empty() {
@@ -585,6 +585,7 @@ fn cmd_set_geometry(ws: &AccessWorkspace, args: &SetGeometryArgs) -> Result<()> 
 }
 
 fn cmd_create_feature(ws: &AccessWorkspace, args: &CreateFeatureArgs) -> Result<()> {
+    ensure_writable(ws)?;
     let fc = ws.open_feature_class(&args.dataset)?;
     let geometries = read_wkt_sources(&args.wkt, &args.wkt_file)?;
     let sets = parse_assignments(fc.fields(), &args.set)?;
@@ -624,6 +625,7 @@ fn insert_one(
 }
 
 fn cmd_create_row(ws: &AccessWorkspace, args: &CreateRowArgs) -> Result<()> {
+    ensure_writable(ws)?;
     let handle = ws.open_dataset(&args.dataset)?;
     let Some(table) = handle.as_table() else {
         return Err(PgdbError::Unsupported(format!(
@@ -639,6 +641,7 @@ fn cmd_create_row(ws: &AccessWorkspace, args: &CreateRowArgs) -> Result<()> {
 }
 
 fn cmd_delete_rows(ws: &AccessWorkspace, args: &DeleteRowsArgs) -> Result<()> {
+    ensure_writable(ws)?;
     if !args.yes {
         return Err(PgdbError::InvalidArgument(
             "删除操作需要显式加 --yes 确认".into(),
@@ -658,6 +661,7 @@ fn cmd_delete_rows(ws: &AccessWorkspace, args: &DeleteRowsArgs) -> Result<()> {
 }
 
 fn cmd_rebuild_index(ws: &AccessWorkspace, dataset: &str) -> Result<()> {
+    ensure_writable(ws)?;
     let fc = ws.open_feature_class(dataset)?;
     let rows = fc.rebuild_shape_index()?;
     let env = fc.refresh_layer_extent()?;
@@ -691,6 +695,7 @@ fn cmd_sql(ws: &AccessWorkspace, statement: &str) -> Result<()> {
         }
         println!("共 {} 行", rows.len());
     } else {
+        ensure_writable(ws)?;
         let n = ws.execute_sql(statement)?;
         ws.backend().flush()?;
         println!("受影响行数 {n}");

@@ -10,11 +10,10 @@
 //! fd.subsets()            ->  IFeatureDataset::Subsets
 //! ```
 //!
-//! 运行：
+//! 运行（需要 `odbc` feature 与驱动）：
 //!
 //! ```bash
-//! cargo run --example traverse                       # 使用内置示例镜像
-//! cargo run --example traverse -- 你的库.mdb          # 需要 odbc feature 与驱动
+//! cargo run --example traverse -- 你的库.mdb
 //! ```
 
 use pgdb::gdb::{
@@ -28,7 +27,7 @@ fn main() -> pgdb::Result<()> {
 
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "examples/sample.mdb.json".to_string());
+        .unwrap_or_else(|| "你的库.mdb".to_string());
     let ws: AccessWorkspace = AccessWorkspaceFactory.open(&path, None)?;
 
     println!("=== 工作空间：{} ===", ws.path());
