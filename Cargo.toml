@@ -1,0 +1,41 @@
+[package]
+name = "pgdb-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["GIS Developer"]
+description = "ESRI Personal Geodatabase (*.mdb) 解析与管理库：要素类/要素数据集遍历、属性与几何更新"
+license = "MIT OR Apache-2.0"
+repository = ""
+keywords = ["gis", "mdb", "personal-geodatabase", "esri", "access"]
+categories = ["science::geo", "parser-implementations"]
+
+[lib]
+name = "pgdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pgdb-cli"
+path = "src/bin/pgdb-cli.rs"
+
+[features]
+default = []
+# 通过 ODBC 驱动访问真实 *.mdb（Windows: Microsoft Access Driver / ACE；Linux: MDBTools 只读）
+odbc = ["dep:odbc-api"]
+
+[dependencies]
+thiserror = "2"
+byteorder = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+odbc-api = { version = "8", optional = true, default-features = false, features = ["narrow", "odbc_version_3_80"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
