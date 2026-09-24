@@ -8,7 +8,8 @@
 //! 3. **新建要素**（`IFeatureClass::Insert` + `IFeatureBuffer`）与删除
 //! 4. 写完后回读校验 ESRI 依赖的一致性数据
 //!
-//! 为避免污染源数据，脚本会把 `*.mdb` 复制一份临时副本再操作（需要 `odbc` feature 与驱动）。
+//! 为避免污染源数据，脚本会把 `*.mdb` 复制一份临时副本再操作
+//! （写库走 ODBC 后端，需要 Access/ACE 驱动）。
 //!
 //! 运行：
 //!
@@ -18,8 +19,8 @@
 
 use pgdb::datastore::Predicate;
 use pgdb::gdb::{
-    AccessWorkspace, AccessWorkspaceFactory, FeatureClass, FeatureWorkspace, QueryFilter, Table,
-    Workspace, WorkspaceFactory,
+    AccessMode, AccessWorkspace, AccessWorkspaceFactory, FeatureClass, FeatureWorkspace,
+    QueryFilter, Table, Workspace,
 };
 use pgdb::geom::{geometry_from_wkt, AsWkt, Geometry, Vertex};
 use pgdb::Value;
@@ -39,7 +40,10 @@ fn main() -> pgdb::Result<()> {
     })?;
     let work_path = work.to_string_lossy().to_string();
 
-    let ws: AccessWorkspace = AccessWorkspaceFactory.open(&work_path, None)?;
+    // 默认打开权限是只读（jetdb，无需驱动）；本示例要写库，显式以读写权限打开
+    // （走 ODBC 后端，需安装与程序位数匹配的 Access/ACE 驱动）
+    let ws: AccessWorkspace =
+        AccessWorkspaceFactory::open_with_mode(&work_path, AccessMode::ReadWrite, None)?;
     println!("工作空间：{}", ws.path());
     println!();
 
@@ -125,9 +129,12 @@ fn main() -> pgdb::Result<()> {
 
     // ================= 6. 删除 =================
     println!("--- 6. 删除要素：ITable::DeleteSearchedRows ---");
-    let deleted = ponds.delete_rows(&QueryFilter::for_oid(new_oid))?;
+    let result = ponds.delete_searched_rows(
+        &QueryFilter::for_oid(new_oid),
+        pgdb::gdb::EditOptions::default(),
+    )?;
     ws.backend().flush()?;
-    println!("  已删除 {deleted} 个要素");
+    println!("  已删除 {} 个要素（命中 {}）", result.affected, result.matched);
 
     // ================= 7. 回读校验 =================
     println!("--- 7. 回读校验 ---");

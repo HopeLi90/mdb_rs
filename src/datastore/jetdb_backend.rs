@@ -245,21 +245,26 @@ impl SqlBackend for JetdbBackend {
     }
 
     fn update(&self, table: &str, _sets: &[(String, SqlValue)], _filter: &Predicate) -> Result<u64> {
-        Err(PgdbError::Unsupported(format!(
-            "jetdb 后端为只读，不支持更新表 {table}"
-        )))
+        Err(Self::read_only_error("更新", table))
     }
 
     fn insert(&self, table: &str, _values: &[(String, SqlValue)]) -> Result<i64> {
-        Err(PgdbError::Unsupported(format!(
-            "jetdb 后端为只读，不支持向表 {table} 插入行"
-        )))
+        Err(Self::read_only_error("插入", table))
     }
 
     fn delete(&self, table: &str, _filter: &Predicate) -> Result<u64> {
-        Err(PgdbError::Unsupported(format!(
-            "jetdb 后端为只读，不支持删除表 {table} 的行"
-        )))
+        Err(Self::read_only_error("删除", table))
+    }
+}
+
+impl JetdbBackend {
+    /// 只读后端写操作的统一错误：给出可操作的改法，而非笼统的「不支持」
+    fn read_only_error(action: &str, table: &str) -> PgdbError {
+        PgdbError::read_only(format!(
+            "当前以只读权限打开（jetdb 后端），无法{action}表 {table}；\
+             如需写入，请改用读写权限重新打开（CLI: --access readwrite；\
+             库 API: AccessMode::ReadWrite，走 ODBC 后端）"
+        ))
     }
 }
 

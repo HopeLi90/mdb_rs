@@ -157,6 +157,19 @@ pub fn where_clause(filter: &Predicate) -> Result<Option<String>> {
                 )))
             }
         }
+        Predicate::In { field, values } => {
+            if values.is_empty() {
+                // 空 IN 集合等价于永假，避免生成 `IN ()` 语法错误
+                Ok(Some("1 = 0".to_string()))
+            } else {
+                let list = values
+                    .iter()
+                    .map(literal)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(Some(format!("{} IN ({})", quote_ident(field), list)))
+            }
+        }
         Predicate::And(list) => {
             let parts: Result<Vec<String>> = list
                 .iter()

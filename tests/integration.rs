@@ -3,8 +3,7 @@
 mod harness;
 
 use pgdb::gdb::{
-    DatasetKind, DatasetNode, FeatureClass, FeatureDataset, FeatureWorkspace,
-    QueryFilter, SpatialFilter, Table, Value, Workspace,
+    DatasetHandle, DatasetKind, DatasetNode, FeatureClass, FeatureDataset, FeatureWorkspace, QueryFilter, SpatialFilter, Table, Value, Workspace, open_workspace_read_only,
 };
 use pgdb::geom::codec::decode_shape;
 use pgdb::geom::{AsWkt, Geometry, GeometryType, Vertex};
@@ -221,7 +220,11 @@ fn insert_and_delete_feature_keeps_index_consistent() {
     // 删除要素时同步清理索引记录
     let feature = ponds.get_feature(oid).unwrap().unwrap();
     let _ = feature;
-    ponds.delete_rows(&QueryFilter::for_oid(oid)).unwrap();
+    ponds.delete_searched_rows(
+        &QueryFilter::for_oid(oid),
+        pgdb::gdb::EditOptions::default(),
+    )
+    .unwrap();
     let rows = ponds
         .backend()
         .select(
@@ -311,4 +314,22 @@ fn raw_shape_bytes_stay_shapefile_compatible() {
         .to_vec();
     let geom = decode_shape(&bytes).unwrap();
     assert!(matches!(geom, Geometry::Polyline(_)));
+}
+
+
+#[test]
+fn open_mdb_test01() {
+    let mdb_path = r"C:\Users\ASUS\Desktop\test.mdb" ;
+    let db = open_workspace_read_only(mdb_path) ;
+    assert!(db.is_ok()) ;
+    let all_datasets = db.unwrap().all_datasets().unwrap() ;
+    for item in all_datasets {
+        let tb_info = match item {
+            DatasetHandle::Table(_t) => (&_t.name().to_string(), _t.row_count(&QueryFilter::default()).unwrap_or_default()),
+            DatasetHandle::FeatureClass(_f) => (&_f.name().to_string(), _f.row_count(&QueryFilter::default()).unwrap_or_default()) ,
+            DatasetHandle::FeatureDataset(_d) => (&_d.name().to_string(), 0),
+        } ;
+        
+        println!("{:?}", tb_info) ;
+    }
 }

@@ -26,10 +26,9 @@ registry = "sparse+https://rsproxy.cn/index/"
 :: 解压 pgdb-rs-src.zip 后进入目录
 cd pgdb-rs
 
-:: 默认（仅内存后端，CLI 仍需 ODBC 才能打开真实 mdb）
-cargo build --release
-
-:: 完整版（ODBC 直连真实 mdb，推荐）
+:: 单一构建即包含双后端：
+::   默认（或 --access readonly）-> 纯 Rust jetdb（无需驱动，仅查询）
+::   --access readwrite          -> ODBC（可写，需 Access/ACE 驱动）
 cargo build --release
 
 :: 产物
@@ -62,16 +61,24 @@ pgdb-cli.exe x drivers
 ## 4. 快速验证
 
 ```bat
-:: 目录树 / 信息
+:: 目录树 / 信息（默认只读 -> jetdb，无需驱动；要写库时加 --access readwrite 走 ODBC）
 pgdb-cli.exe D:\data\你的库.mdb info
 pgdb-cli.exe D:\data\你的库.mdb tree
 pgdb-cli.exe D:\data\你的库.mdb export-wkt Roads
 
-:: 属性更新（IFeature::Store 语义）
-pgdb-cli.exe D:\data\你的库.mdb update-attr Roads --oid 1 --set NAME=长安街
+:: 编辑前体检 / 演练（不写库）
+pgdb-cli.exe --dry-run D:\data\你的库.mdb delete-rows Roads --oids 1,2,999
+pgdb-cli.exe D:\data\你的库.mdb preflight Roads
+
+:: 属性更新（ITable::UpdateSearchedRows 语义；写入必须 --access readwrite，全表更新还需 --all）
+pgdb-cli.exe --access readwrite D:\data\你的库.mdb update-attr Roads --oid 1 --set NAME=长安街
+
+:: 按 OID 列表删除 / 按条件删除（必须 --yes）
+pgdb-cli.exe --access readwrite D:\data\你的库.mdb delete-rows Roads --oids 3,4 --yes
+pgdb-cli.exe --access readwrite D:\data\你的库.mdb delete-rows Roads --where "NAME = '旧路'" --yes
 
 :: 几何更新（自动维护 Shape_Length / Shape_Area / 空间索引 / 图层范围）
-pgdb-cli.exe D:\data\你的库.mdb set-geometry Roads --oid 2 --wkt "LINESTRING(20 20, 30 30)"
+pgdb-cli.exe --access readwrite D:\data\你的库.mdb set-geometry Roads --oid 2 --wkt "LINESTRING(20 20, 30 30)"
 
 :: 要素数据集内的要素类用限定名
 pgdb-cli.exe D:\data\你的库.mdb export-wkt Hydrology\Ponds
@@ -114,11 +121,18 @@ cargo test --test odbc_real -- --ignored --test-threads=1
 
 ```toml
 [dependencies]
-pgdb = { path = "path/to/pgdb-rs", features = ["odbc"] }
+pgdb = { path = "path/to/pgdb-rs" }
 ```
 
-入口 API 与 ArcObjects 对应：`AccessWorkspaceFactory::open_odbc`（`IWorkspaceFactory::Open`）
-→ `ws.datasets()`（`IEnumDataset`）→ `ws.open_feature_class`（`IFeatureWorkspace::OpenFeatureClass`），
+无需选择 feature：**读写权限枚举在运行时决定后端，默认只读**——
+`AccessMode::ReadOnly`（默认）走纯 Rust 的 jetdb（仅查询、无需驱动），
+`AccessMode::ReadWrite` 显式传入后走 ODBC（可写）。
+
+入口 API 与 ArcObjects 对应：`AccessWorkspaceFactory::open_with_mode(path, mode, None)`
+（`IWorkspaceFactory::Open`）→ `ws.datasets()`（`IEnumDataset`）→
+`ws.open_feature_class`（`IFeatureWorkspace::OpenFeatureClass`），
+批量编辑用 `table.update_searched_rows / delete_searched_rows / delete_rows /
+delete_all_rows / preflight_edit`（`EditOptions` + `EditResult`），
 遍历与更新示例见 `README.md` 与 `examples/`。
 
 ## 7. 关于中文对象名与中文乱码
@@ -126,7 +140,7 @@ pgdb = { path = "path/to/pgdb-rs", features = ["odbc"] }
 本项目的 `odbc-api` 依赖以 **`narrow` 特性**编译：
 
 ```toml
-odbc-api = { version = "8", optional = true, default-features = false,
+odbc-api = { version = "8", default-features = false,
              features = ["narrow", "odbc_version_3_80"] }
 ```
 

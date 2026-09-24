@@ -166,8 +166,9 @@ impl OdbcBackend {
 
     fn ensure_writable(&self) -> Result<()> {
         if !self.caps.writable {
-            return Err(PgdbError::Backend(
-                "当前 ODBC 驱动为只读（MDBTools 不支持写）".into(),
+            return Err(PgdbError::read_only(
+                "当前 ODBC 驱动为只读（例如 Linux 下的 MDBTools 驱动），不支持写入；\
+                 请使用 Windows + Microsoft Access Database Engine 驱动（位数须与程序一致）",
             ));
         }
         Ok(())

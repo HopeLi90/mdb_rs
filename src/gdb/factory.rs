@@ -114,7 +114,8 @@ impl WorkspaceFactory for AccessWorkspaceFactory {
     fn open(&self, path: &str, options: Option<WorkspaceOptions>) -> Result<AccessWorkspace> {
         // 按 `WorkspaceOptions::access_mode` 选择后端：只读 -> jetdb（纯 Rust，无驱动）；
         // 读写 -> ODBC（需安装与程序位数匹配的 Access/ACE 驱动）。
-        // 未显式给选项时按默认权限（读写）打开。
+        // 未显式给选项时按默认权限（只读）打开；要写入请显式传 ReadWrite
+        // 或改用 `open_with_mode(path, AccessMode::ReadWrite, ...)`。
         let opts = options.unwrap_or_default();
         let backend = crate::datastore::open_backend(path, opts.access_mode, None)?;
         let backend: Arc<dyn SqlBackend> = Arc::from(backend);

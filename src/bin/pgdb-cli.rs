@@ -16,9 +16,9 @@
 //!
 //! 数据源为真实 `*.mdb` / `*.accdb`，由 `--access` 指定**读写权限**，
 //! 权限决定使用哪种解析方式：
-//! - `--access readonly`（或 `--read-only`）：纯 Rust 的 **jetdb** 解析，
-//!   无需任何驱动、跨平台，仅支持查询；
-//! - `--access readwrite`（默认）：**ODBC** 驱动解析，支持读写，
+//! - `--access readonly`（**默认**，或兼容简写 `--read-only`）：纯 Rust 的 **jetdb**
+//!   解析，无需任何驱动、跨平台，仅支持查询；
+//! - `--access readwrite`：**ODBC** 驱动解析，支持读写，
 //!   需要安装与程序位数匹配的 Access/ACE 驱动。
 
 use std::path::Path;
@@ -26,10 +26,11 @@ use std::path::Path;
 use clap::{Args, Parser, Subcommand};
 
 use pgdb::gdb::{
-    AccessMode, AccessWorkspace, AccessWorkspaceFactory, DatasetHandle, DatasetKind, FeatureClass,
-    FeatureWorkspace, InsertFeatureCursor, MetadataModel, QueryFilter, SpatialReference, Table,
-    Workspace,
+    AccessMode, AccessWorkspace, AccessWorkspaceFactory, DatasetHandle, DatasetKind, EditOptions,
+    FeatureClass, FeatureWorkspace, InsertFeatureCursor, MetadataModel, Preflight, QueryFilter,
+    SpatialReference, Table, Workspace,
 };
+use pgdb::datastore::Predicate;
 use pgdb::geom::{geometry_from_wkt, AsWkt, Geometry};
 use pgdb::{pad_display, Field, FieldType, Fields, PgdbError, Result, Value};
 
@@ -53,13 +54,16 @@ fn main() {
     about = "ESRI Personal Geodatabase (*.mdb) 解析与管理工具"
 )]
 struct Cli {
-    /// 读写权限：`readonly` 用纯 Rust 的 jetdb 解析（仅查询、无需驱动）；
+    /// 读写权限：`readonly` 用纯 Rust 的 jetdb 解析（仅查询、无需驱动，默认）；
     /// `readwrite` 用 ODBC 驱动解析（可写，需匹配位数的 Access/ACE 驱动）
     #[arg(long, value_name = "MODE", value_parser = parse_access_mode, global = true)]
     access: Option<AccessMode>,
-    /// 等价于 `--access readonly`（保留的简写形式）
+    /// 等价于 `--access readonly`（兼容的显式简写；不传 --access 时本就是只读）
     #[arg(long, global = true, conflicts_with = "access")]
     read_only: bool,
+    /// 演练模式：对更新/删除命令只做预检（打印命中行数/范围/可写性），不实际写库
+    #[arg(long, global = true)]
+    dry_run: bool,
     /// 数据源路径（真实 `*.mdb` / `*.accdb`）
     database: String,
 
@@ -98,7 +102,7 @@ enum Command {
     Rows(RowsArgs),
     /// 导出要素几何的 WKT（`IFeature::Shape`）
     ExportWkt(ExportWktArgs),
-    /// 更新属性（`ITable::Update` + `IRow::Store`）
+    /// 批量更新属性（`ITable::UpdateSearchedRows`）
     UpdateAttr(UpdateAttrArgs),
     /// 更新几何（`IFeature::Store`，自动维护长度/面积、空间索引、图层范围）
     SetGeometry(SetGeometryArgs),
@@ -106,8 +110,23 @@ enum Command {
     CreateFeature(CreateFeatureArgs),
     /// 新建一行属性记录（不含几何）
     CreateRow(CreateRowArgs),
-    /// 按条件删除行
+    /// 按条件或 OBJECTID 列表删除（`DeleteSearchedRows` / `ITable::DeleteRows`）
     DeleteRows(DeleteRowsArgs),
+    /// 清空整张表（`ITable::DeleteAllRows` 语义，必须 --yes）
+    DeleteAllRows {
+        /// 表名或要素类名
+        dataset: String,
+        /// 确认清空（必填，防误操作）
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 编辑前体检：打印命中行数/作用范围/可写性，不做任何修改
+    Preflight {
+        /// 数据集名
+        dataset: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
     /// 重建空间索引并重算图层范围
     RebuildIndex {
         /// 要素类名
@@ -179,6 +198,9 @@ struct UpdateAttrArgs {
     /// 字段赋值，形如 `FIELD=VALUE`，可重复
     #[arg(long = "set", value_name = "FIELD=VALUE", required = true)]
     set: Vec<String>,
+    /// 显式确认作用于全表（过滤器未给条件时必须加此开关）
+    #[arg(long)]
+    all: bool,
     #[command(flatten)]
     filter: FilterArgs,
 }
@@ -228,6 +250,10 @@ struct DeleteRowsArgs {
     /// 确认删除（避免误操作）
     #[arg(long)]
     yes: bool,
+    /// 按 OBJECTID 列表删除（`ITable::DeleteRows` 语义），逗号分隔；
+    /// 给出时忽略 --where/--oid 过滤器
+    #[arg(long, value_delimiter = ',', value_name = "OID,OID,...")]
+    oids: Vec<i64>,
     #[command(flatten)]
     filter: FilterArgs,
 }
@@ -237,15 +263,13 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Drivers = cli.command {
         return cmd_drivers();
     }
-    // 由 `--access`（或简写 `--read-only`）解析出读写权限，权限决定解析后端
-    let mode = cli
-        .access
-        .unwrap_or(if cli.read_only {
-            AccessMode::ReadOnly
-        } else {
-            AccessMode::ReadWrite
-        });
+    // 由 `--access`（或兼容简写 `--read-only`）解析出读写权限，权限决定解析后端；
+    // 未显式指定时默认 **只读**（jetdb，无需驱动、不可能误改数据）
+    let mode = cli.access.unwrap_or(AccessMode::ReadOnly);
     let ws = open_workspace(&cli.database, mode)?;
+    if cli.dry_run && is_destructive(&cli.command) {
+        return cmd_dry_run(&ws, &cli.command);
+    }
     match cli.command {
         Command::Drivers => unreachable!("已在上方处理"),
         Command::Info => cmd_info(&ws),
@@ -262,9 +286,87 @@ fn run(cli: Cli) -> Result<()> {
         Command::CreateFeature(args) => cmd_create_feature(&ws, &args),
         Command::CreateRow(args) => cmd_create_row(&ws, &args),
         Command::DeleteRows(args) => cmd_delete_rows(&ws, &args),
+        Command::DeleteAllRows { dataset, yes } => cmd_delete_all_rows(&ws, &dataset, yes),
+        Command::Preflight { dataset, filter } => cmd_preflight(&ws, &dataset, &filter),
         Command::RebuildIndex { dataset } => cmd_rebuild_index(&ws, &dataset),
         Command::Sql { statement } => cmd_sql(&ws, &statement),
     }
+}
+
+/// 该命令是否会修改数据（`--dry-run` 只对这些命令做预检拦截）
+fn is_destructive(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::UpdateAttr(_)
+            | Command::SetGeometry(_)
+            | Command::DeleteRows(_)
+            | Command::DeleteAllRows { .. }
+            | Command::RebuildIndex { .. }
+    )
+}
+
+/// 提取破坏性命令的数据集与过滤器，供演练预检
+fn destructive_target(cmd: &Command) -> Option<(String, QueryFilter)> {
+    match cmd {
+        Command::UpdateAttr(a) => Some((a.dataset.clone(), a.filter.to_filter())),
+        Command::SetGeometry(a) => Some((a.dataset.clone(), a.filter.to_filter())),
+        Command::DeleteRows(a) => Some((a.dataset.clone(), a.filter.to_filter())),
+        Command::DeleteAllRows { dataset, .. } => {
+            Some((dataset.clone(), QueryFilter::new()))
+        }
+        Command::RebuildIndex { dataset } => Some((dataset.clone(), QueryFilter::new())),
+        _ => None,
+    }
+}
+
+/// `--dry-run`：对破坏性命令只做体检（preflight），不写库
+fn cmd_dry_run(ws: &AccessWorkspace, cmd: &Command) -> Result<()> {
+    println!("[dry-run] 以下为预检结果，未做任何修改：");
+    // delete-rows --oids 走 ITable::DeleteRows 的 OID 数组语义，按列表预检
+    if let Command::DeleteRows(a) = cmd {
+        if !a.oids.is_empty() {
+            return dry_run_oid_list(ws, &a.dataset, &a.oids);
+        }
+    }
+    let Some((dataset, filter)) = destructive_target(cmd) else {
+        return Ok(());
+    };
+    let handle = ws.open_dataset(&dataset)?;
+    let Some(table) = handle.as_table() else {
+        return Err(PgdbError::Unsupported(format!("{dataset} 不是表/要素类")));
+    };
+    let pre = table.preflight_edit(&filter)?;
+    println!("  数据集   : {dataset}");
+    println!("  命中行数 : {}", pre.matched);
+    println!("  作用范围 : {}", pre.scope);
+    println!("  可写性   : {}", if pre.writable { "可写" } else { "只读" });
+    if pre.is_whole_table() {
+        println!("  ⚠ 全表操作：执行时需要显式确认（--all / --yes）");
+    }
+    if pre.is_no_hit() {
+        println!("  ⚠ 零命中：请核对过滤条件是否写错");
+    }
+    Ok(())
+}
+
+/// `--dry-run` 下 `delete-rows --oids` 的预检：按 OID 列表计数并提示不存在的 OID
+fn dry_run_oid_list(ws: &AccessWorkspace, dataset: &str, oids: &[i64]) -> Result<()> {
+    let handle = ws.open_dataset(dataset)?;
+    let Some(table) = handle.as_table() else {
+        return Err(PgdbError::Unsupported(format!("{dataset} 不是表/要素类")));
+    };
+    let pred = Predicate::in_ids(table.oid_field_name().to_string(), oids);
+    let matched = table.backend().count(table.table_name(), &pred)?;
+    let writable = table.backend().capabilities().writable;
+    println!("  数据集   : {dataset}");
+    println!("  指定 OID : {} 个", oids.len());
+    println!("  命中行数 : {matched}");
+    println!("  可写性   : {}", if writable { "可写" } else { "只读" });
+    let missing = (oids.len() as u64).saturating_sub(matched);
+    if missing > 0 {
+        println!("  ⚠ 有 {missing} 个 OBJECTID 在表中不存在");
+    }
+    Ok(())
 }
 
 /// 按读写权限打开工作空间：权限枚举直接决定后端（jetdb / ODBC），
@@ -531,19 +633,22 @@ fn cmd_update_attr(ws: &AccessWorkspace, args: &UpdateAttrArgs) -> Result<()> {
     };
     let sets = parse_assignments(table.fields(), &args.set)?;
     let filter = args.filter.to_filter();
-
-    // ArcEngine 语义：ITable::Update 取游标 -> IRow::put_Value -> IRow::Store
-    let mut cursor = table.update(filter)?;
-    let mut affected = 0usize;
-    while let Some(mut row) = cursor.next_row()? {
-        for (name, value) in &sets {
-            row.set_value_by_name(name, value.clone())?;
-        }
-        row.store()?;
-        affected += 1;
-    }
+    // ArcEngine 语义：ITable::UpdateSearchedRows —— 一条批量 UPDATE；
+    // 全表防护由 EditOptions 承载，--all 即显式确认全表。
+    let opts = EditOptions::default();
+    let opts = if args.all { opts.whole_table() } else { opts };
+    let result = table.update_searched_rows(&sets, &filter, opts)?;
     ws.backend().flush()?;
-    println!("已更新 {affected} 行：{}", join_names(&sets));
+    println!(
+        "已更新 {} 行（命中 {}，范围：{}）：{}",
+        result.affected,
+        result.matched,
+        result.scope,
+        join_names(&sets)
+    );
+    if result.is_no_hit() {
+        println!("⚠ 零命中：过滤条件没有匹配到任何行，请核对条件是否写错。");
+    }
     Ok(())
 }
 
@@ -654,9 +759,83 @@ fn cmd_delete_rows(ws: &AccessWorkspace, args: &DeleteRowsArgs) -> Result<()> {
             args.dataset
         )));
     };
-    let n = table.delete_rows(&args.filter.to_filter())?;
+    // --oids 给出时走 ITable::DeleteRows（OID 数组）路径；否则走 DeleteSearchedRows
+    let result = if !args.oids.is_empty() {
+        table.delete_rows(&args.oids)?
+    } else {
+        let filter = args.filter.to_filter();
+        // --yes 即全表确认（过滤器无任何条件时放行）
+        let opts = if filter.is_trivial() {
+            EditOptions::default().whole_table()
+        } else {
+            EditOptions::default()
+        };
+        table.delete_searched_rows(&filter, opts)?
+    };
     ws.backend().flush()?;
-    println!("已删除 {n} 行");
+    println!(
+        "已删除 {} 行（命中 {}，范围：{}）",
+        result.affected, result.matched, result.scope
+    );
+    if result.is_no_hit() {
+        println!("⚠ 零命中：过滤条件没有匹配到任何行，请核对条件是否写错。");
+    } else if !args.oids.is_empty() && result.matched < args.oids.len() as u64 {
+        println!(
+            "⚠ 有 {} 个 OBJECTID 不存在（给 {} 个，命中 {} 个）。",
+            args.oids.len() as u64 - result.matched,
+            args.oids.len(),
+            result.matched
+        );
+    }
+    Ok(())
+}
+
+/// 清空整张表（`ITable::DeleteAllRows` 语义）
+fn cmd_delete_all_rows(ws: &AccessWorkspace, dataset: &str, yes: bool) -> Result<()> {
+    ensure_writable(ws)?;
+    if !yes {
+        return Err(PgdbError::InvalidArgument(
+            "清空整张表属于危险操作，必须显式加 --yes 确认".into(),
+        ));
+    }
+    let handle = ws.open_dataset(dataset)?;
+    // 先记录要素类的当前图层范围，用于删除后对比展示
+    let old_extent = handle.as_feature_class().and_then(|fc| fc.extent());
+    let Some(table) = handle.as_table() else {
+        return Err(PgdbError::Unsupported(format!("{dataset} 不是表/要素类")));
+    };
+    let result = table.delete_all_rows()?;
+    ws.backend().flush()?;
+    println!("已清空 {dataset}：删除 {} 行（全表）", result.affected);
+    if handle.as_feature_class().is_some() {
+        match old_extent {
+            Some(env) if !env.is_empty() => println!(
+                "图层范围已重置为零范围（原范围 {:.4}, {:.4} ~ {:.4}, {:.4}）",
+                env.min_x, env.min_y, env.max_x, env.max_y
+            ),
+            _ => println!("图层范围已重置为零范围"),
+        }
+    }
+    Ok(())
+}
+
+/// 编辑前体检（`ISelectionSet::Count` + `IWorkspace::IsReadOnly` 语义）
+fn cmd_preflight(ws: &AccessWorkspace, dataset: &str, filter: &FilterArgs) -> Result<()> {
+    let handle = ws.open_dataset(dataset)?;
+    let Some(table) = handle.as_table() else {
+        return Err(PgdbError::Unsupported(format!("{dataset} 不是表/要素类")));
+    };
+    let pre: Preflight = table.preflight_edit(&filter.to_filter())?;
+    println!("数据集   : {dataset}");
+    println!("命中行数 : {}", pre.matched);
+    println!("作用范围 : {}", pre.scope);
+    println!("可写性   : {}", if pre.writable { "可写" } else { "只读" });
+    if pre.is_whole_table() {
+        println!("⚠ 全表操作：执行更新/删除需要显式确认（--all / --yes）");
+    }
+    if pre.matched == 0 {
+        println!("⚠ 零命中：请核对过滤条件是否写错");
+    }
     Ok(())
 }
 

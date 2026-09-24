@@ -85,6 +85,16 @@ impl QueryFilter {
         }
     }
 
+    /// 是否为「无任何条件」的空过滤器（等价于作用全表）。
+    ///
+    /// 用于批量编辑前的全表防护：`UpdateSearchedRows`/`DeleteSearchedRows`
+    /// 拿到 trivial 过滤器时必须显式确认才放行。
+    pub fn is_trivial(&self) -> bool {
+        self.oid.is_none()
+            && self.where_clause.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && self.spatial.is_none()
+    }
+
     /// 设置 WHERE 子句
     pub fn with_where<S: Into<String>>(mut self, clause: S) -> Self {
         self.where_clause = Some(clause.into());

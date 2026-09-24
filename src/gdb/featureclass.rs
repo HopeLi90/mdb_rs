@@ -1,16 +1,17 @@
 //! 要素类：`IFeatureClass` 的 Rust 版本，包含几何写入时的 ESRI 一致性维护。
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::datastore::{Predicate, SqlBackend, SqlValue};
-use crate::error::Result;
+use crate::error::{PgdbError, Result};
 use crate::field::{Field, Fields};
 use crate::geom::codec::{decode_shape, encode_shape};
-use crate::geom::{Envelope, Geometry, GeometryType};
+use crate::geom::{geometry_from_wkt, Envelope, Geometry, GeometryType};
 use crate::value::Value;
 
 use super::cursor::{FeatureIter, InsertFeatureCursor, InsertRowCursor, RowIter};
 use super::dataset::DatasetNode;
+use super::edit::{EditOptions, EditResult, EditScope, Preflight};
 use super::filter::QueryFilter;
 use super::metadata::{CatalogEntry, DatasetKind, FeatureType, GridInfo, SpatialReference};
 use super::row::{Feature, Row, RowBuffer};
@@ -124,7 +125,8 @@ pub struct PgdbFeatureClass {
     feature_type: FeatureType,
     srid: Option<i64>,
     spatial_ref: Option<SpatialReference>,
-    extent: Option<Envelope>,
+    /// 图层范围缓存（删除/重算后同步更新；用 RwLock 支持 `&self` 内部可变）
+    extent: RwLock<Option<Envelope>>,
     grid: GridInfo,
     length_field: Option<String>,
     area_field: Option<String>,
@@ -170,7 +172,7 @@ impl PgdbFeatureClass {
             feature_type: entry.feature_type,
             srid: entry.srid,
             spatial_ref,
-            extent: entry.extent,
+            extent: RwLock::new(entry.extent),
             grid,
             length_field,
             area_field,
@@ -194,19 +196,40 @@ impl PgdbFeatureClass {
         out
     }
 
-    /// 内部：从几何申请 — Shape 列的二进制值
-    fn decode_values(&self, values: &[(String, Value)]) -> Option<Result<crate::geom::Geometry>> {
+    /// 统一的「字段值 -> 几何」解码入口（`Blob` 二进制 / WKT 文本 / `Null` 三态一致）。
+    ///
+    /// 无论从 CLI 的 `--set Shape=<WKT>`、游标的 `set_value` 还是 `store_row`
+    /// 进入，几何值的解释都在这里收敛，避免出现"批量更新只认 Blob、
+    /// WKT 被静默丢弃"的缝隙。
+    pub(crate) fn geometry_from_value(&self, v: &Value) -> Result<Geometry> {
+        match v {
+            Value::Null => Ok(Geometry::Null),
+            Value::Blob(b) => decode_shape(b),
+            Value::String(s) => geometry_from_wkt(s),
+            other => Err(PgdbError::Conversion {
+                field: self.shape_field.clone(),
+                message: format!("无法把该值解释为几何: {other}"),
+            }),
+        }
+    }
+
+    /// 统一的「几何 -> 落库值」编码出口（解码的镜像操作）。
+    ///
+    /// `Null` 保持 NULL，其余几何一律编码为 ESRI Shape 二进制，
+    /// 保证 LONGVARBINARY 几何列里永远不会混入 TEXT 值。
+    fn encode_geometry_value(&self, g: &Geometry) -> Result<Value> {
+        match g {
+            Geometry::Null => Ok(Value::Null),
+            other => Ok(Value::Blob(encode_shape(other)?)),
+        }
+    }
+
+    /// 内部：从 sets 中提取 Shape 列的几何（无几何列时返回 None）
+    fn decode_values(&self, values: &[(String, Value)]) -> Option<Result<Geometry>> {
         values
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(&self.shape_field))
-            .map(|(_, v)| match v {
-                Value::Blob(b) => decode_shape(b),
-                Value::Null => Ok(Geometry::Null),
-                other => Err(crate::error::PgdbError::Conversion {
-                    field: self.shape_field.clone(),
-                    message: format!("几何值不是二进制: {other}"),
-                }),
-            })
+            .map(|(_, v)| self.geometry_from_value(v))
     }
 
     /// 内部：同步 <表>_SHAPE_Index 的网格记录
@@ -245,7 +268,10 @@ impl PgdbFeatureClass {
             return Ok(());
         }
         let table = &self.core.table_name;
-        update_geom_columns_extent(&self.core.backend, table, env)
+        let merged = update_geom_columns_extent(&self.core.backend, table, env)?;
+        // 同步内存缓存，保证 extent() 与 GDB_GeomColumns 一致
+        *self.extent.write().unwrap() = Some(merged);
+        Ok(())
     }
 
     /// 写入前的几何规范化（环方向、闭合），并把结果写回 sets 中的 Shape 列
@@ -287,6 +313,18 @@ impl PgdbFeatureClass {
 
     /// 全部几何（用于范围重算与空间索引重建）
     fn scan_feature_envelopes(&self) -> Result<Vec<(i64, Option<Envelope>)>> {
+        self.select_oid_envelopes(&Predicate::All, None)
+    }
+
+    /// 按谓词选取（OBJECTID, 几何信封）对，可选附加内存空间过滤。
+    ///
+    /// 删除路径专用：**只取 OID 与 Shape 两列**（忽略 filter.sub_fields，
+    /// 保证删除前总能拿到主键与几何），供索引清理与范围回缩决策使用。
+    fn select_oid_envelopes(
+        &self,
+        pred: &Predicate,
+        spatial: Option<&super::filter::SpatialFilter>,
+    ) -> Result<Vec<(i64, Option<Envelope>)>> {
         let fields = vec![
             self.core.oid_field.clone(),
             self.shape_field.clone(),
@@ -294,7 +332,7 @@ impl PgdbFeatureClass {
         let rows = self
             .core
             .backend
-            .select(&self.core.table_name, &fields, &Predicate::All)?;
+            .select(&self.core.table_name, &fields, pred)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let oid = r
@@ -305,9 +343,54 @@ impl PgdbFeatureClass {
                 Some(b) => decode_shape(b).ok().and_then(|g| g.envelope()),
                 None => None,
             };
+            if let Some(sp) = spatial {
+                let target = sp.geometry.envelope();
+                let Some(target) = target else { continue };
+                let keep = super::table::spatial_match(&sp.relation, env, &target);
+                if !keep {
+                    continue;
+                }
+            }
             out.push((oid, env));
         }
         Ok(out)
+    }
+
+    /// 删除后的图层范围回缩。
+    ///
+    /// 若被删要素的合并信封**严格位于**当前图层范围内部（不触及任何边界），
+    /// 删除不可能缩小范围，直接跳过全表重算；否则调用
+    /// [`FeatureClass::refresh_layer_extent`] 覆写回正确范围。
+    fn shrink_extent_after_delete(&self, deleted_env: Option<Envelope>) -> Result<()> {
+        if !self.policy.maintain_layer_extent {
+            return Ok(());
+        }
+        let Some(deleted) = deleted_env else {
+            return Ok(()); // 删除的要素没有几何，范围必然不变
+        };
+        let Some(current) = self.extent() else {
+            return Ok(());
+        };
+        let touches_boundary = approx_eq(deleted.min_x, current.min_x)
+            || approx_eq(deleted.min_y, current.min_y)
+            || approx_eq(deleted.max_x, current.max_x)
+            || approx_eq(deleted.max_y, current.max_y);
+        if !touches_boundary && current.contains_envelope(&deleted) {
+            return Ok(()); // 内部删除：范围不变，跳过 O(n) 重算
+        }
+        self.refresh_layer_extent()?;
+        Ok(())
+    }
+
+    /// 清空图层范围（delete-all 后调用，写回零范围并同步缓存）
+    fn reset_layer_extent(&self) -> Result<()> {
+        if !self.policy.maintain_layer_extent {
+            return Ok(());
+        }
+        let zero = Envelope::new(0.0, 0.0, 0.0, 0.0);
+        set_geom_columns_extent(&self.core.backend, &self.core.table_name, &zero)?;
+        *self.extent.write().unwrap() = Some(zero);
+        Ok(())
     }
 
     /// 核心状态
@@ -373,14 +456,15 @@ fn grid_cells(env: &Envelope, origin_x: f64, origin_y: f64, size: f64) -> (f64, 
     (min_gx, min_gy, max_gx, max_gy)
 }
 
-/// 更新 GDB_GeomColumns 的图层范围
+/// 更新 GDB_GeomColumns 的图层范围：与现有范围做**并集**（只扩不缩），
+/// 供插入/更新几何时使用。返回合并后的最终范围，供调用方同步内存缓存。
 fn update_geom_columns_extent(
     backend: &Arc<dyn SqlBackend>,
     table: &str,
     env: &Envelope,
-) -> Result<()> {
+) -> Result<Envelope> {
     if !backend.table_exists("GDB_GeomColumns")? {
-        return Ok(());
+        return Ok(*env);
     }
     let rows = backend.select(
         "GDB_GeomColumns",
@@ -388,7 +472,7 @@ fn update_geom_columns_extent(
         &Predicate::eq("TableName", table.to_string()),
     )?;
     let Some(row) = rows.first() else {
-        return Ok(());
+        return Ok(*env);
     };
     let merged = match (
         super::metadata::pick(row, &["ExtentLeft"]).and_then(|v| v.to_f64()),
@@ -399,17 +483,38 @@ fn update_geom_columns_extent(
         (Some(l), Some(b), Some(r), Some(t)) => env.union(&Envelope::new(l, b, r, t)),
         _ => *env,
     };
+    set_geom_columns_extent(backend, table, &merged)?;
+    Ok(merged)
+}
+
+/// **覆写** GDB_GeomColumns 的图层范围（不做并集）。
+///
+/// 供范围重算（`refresh_layer_extent`）与删除后回缩使用：
+/// 重算得到的范围就是最终事实，若仍走并集会让"曾经偏大"的范围永远无法纠正。
+fn set_geom_columns_extent(
+    backend: &Arc<dyn SqlBackend>,
+    table: &str,
+    env: &Envelope,
+) -> Result<()> {
+    if !backend.table_exists("GDB_GeomColumns")? {
+        return Ok(());
+    }
     backend.update(
         "GDB_GeomColumns",
         &[
-            ("ExtentLeft".into(), SqlValue::F64(merged.min_x)),
-            ("ExtentBottom".into(), SqlValue::F64(merged.min_y)),
-            ("ExtentRight".into(), SqlValue::F64(merged.max_x)),
-            ("ExtentTop".into(), SqlValue::F64(merged.max_y)),
+            ("ExtentLeft".into(), SqlValue::F64(env.min_x)),
+            ("ExtentBottom".into(), SqlValue::F64(env.min_y)),
+            ("ExtentRight".into(), SqlValue::F64(env.max_x)),
+            ("ExtentTop".into(), SqlValue::F64(env.max_y)),
         ],
         &Predicate::eq("TableName", table.to_string()),
     )?;
     Ok(())
+}
+
+/// 浮点近似相等（边界比较用）
+fn approx_eq(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9f64.max(a.abs().max(b.abs()) * 1e-9)
 }
 
 impl DatasetNode for PgdbFeatureClass {
@@ -438,7 +543,8 @@ impl DatasetNode for PgdbFeatureClass {
         Some(Table::row_count(self, &QueryFilter::new()))
     }
     fn update_any(&self, filter: &QueryFilter, sets: &[(String, Value)]) -> Result<u64> {
-        self.update_features_rows(sets, filter)
+        self.update_features_rows(sets, filter, EditOptions::default())
+            .map(|r| r.affected)
     }
 }
 
@@ -478,26 +584,58 @@ impl Table for PgdbFeatureClass {
     fn row_count(&self, filter: &QueryFilter) -> Result<u64> {
         self.core.row_count(filter)
     }
-    fn update_rows(&self, sets: &[(String, Value)], filter: &QueryFilter) -> Result<u64> {
-        self.update_features_rows(sets, filter)
+    fn update_searched_rows(
+        &self,
+        sets: &[(String, Value)],
+        filter: &QueryFilter,
+        opts: EditOptions,
+    ) -> Result<EditResult> {
+        self.update_features_rows(sets, filter, opts)
     }
-    fn delete_rows(&self, filter: &QueryFilter) -> Result<u64> {
-        // 先取到 OID 列表，保证空间索引记录同步删除
-        let pred = filter.to_predicate(&self.core.oid_field);
-        let rows = self.core.backend.select(
-            &self.core.table_name,
-            std::slice::from_ref(&self.core.oid_field),
+    fn delete_searched_rows(&self, filter: &QueryFilter, opts: EditOptions) -> Result<EditResult> {
+        let scope = if filter.is_trivial() {
+            EditScope::WholeTable
+        } else {
+            EditScope::Filtered
+        };
+        self.delete_features_rows(
+            &filter.to_predicate(&self.core.oid_field),
+            filter.spatial.as_ref(),
+            opts,
+            scope,
+            "删除",
+        )
+    }
+    fn delete_rows(&self, oids: &[i64]) -> Result<EditResult> {
+        let pred = Predicate::in_ids(self.core.oid_field.clone(), oids);
+        self.delete_features_rows(
             &pred,
-        )?;
-        let oids: Vec<i64> = rows
-            .iter()
-            .filter_map(|r| r.get(&self.core.oid_field).and_then(|v| v.to_i64()))
-            .collect();
-        let n = self.core.delete_rows(filter)?;
-        for oid in oids {
-            self.delete_shape_index_rows(oid)?;
+            None,
+            EditOptions::default(),
+            EditScope::Filtered,
+            "删除",
+        )
+    }
+    fn delete_all_rows(&self) -> Result<EditResult> {
+        let matched = self.core.row_count(&QueryFilter::new())?;
+        if matched == 0 {
+            return Ok(EditResult::new(0, 0, EditScope::WholeTable));
         }
-        Ok(n)
+        // 清空空间索引记录（整表删除索引行即可，无需逐 OID）
+        if self.policy.maintain_shape_index {
+            if let Some(table) = &self.shape_index_table {
+                self.core.backend.delete(table, &Predicate::All)?;
+            }
+        }
+        let affected = self
+            .core
+            .backend
+            .delete(&self.core.table_name, &Predicate::All)?;
+        self.reset_layer_extent()?;
+        Ok(EditResult::new(matched, affected, EditScope::WholeTable))
+    }
+    fn preflight_edit(&self, filter: &QueryFilter) -> Result<Preflight> {
+        self.core.preflight_edit(filter)
     }
     fn insert_row(&self, values: &[(String, Value)]) -> Result<i64> {
         self.insert_feature(values)
@@ -507,6 +645,15 @@ impl Table for PgdbFeatureClass {
         if let Some(geometry) = self.decode_values(&sets) {
             let geometry = geometry?;
             let geometry = self.normalize_in_place(&mut sets, geometry)?;
+            // 几何列统一落库为 ESRI 二进制：WKT 文本在此编码，Null 保持 NULL，
+            // 避免 TEXT 值混入 LONGVARBINARY 列导致后续读取解码失败
+            let encoded = self.encode_geometry_value(&geometry)?;
+            if let Some((_, v)) = sets
+                .iter_mut()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&self.shape_field))
+            {
+                *v = encoded;
+            }
             for (k, v) in self.measurement_updates(&geometry) {
                 if !sets.iter().any(|(n, _)| n.eq_ignore_ascii_case(&k)) {
                     sets.push((k, v));
@@ -551,35 +698,89 @@ impl PgdbFeatureClass {
         Ok(())
     }
 
-    /// 要素类的批量属性/几何更新入口
+    /// 要素类统一的批量删除入口：删除业务行 + 清理 `_SHAPE_Index` + 回缩图层范围。
+    ///
+    /// `pred`/`spatial` 共同确定删除集合；先以「OID + Shape」两列取出待删要素
+    /// （顺带得到合并信封），再整体删除，最后按需重算图层范围。
+    fn delete_features_rows(
+        &self,
+        pred: &Predicate,
+        spatial: Option<&super::filter::SpatialFilter>,
+        opts: EditOptions,
+        scope: EditScope,
+        action: &str,
+    ) -> Result<EditResult> {
+        self.core.ensure_writable(action)?;
+        if scope.is_whole_table() {
+            // 全表删除走 delete_all_rows，这里防御性地拒绝
+            return Err(PgdbError::InvalidArgument(
+                "清空整张表请使用 delete_all_rows()（CLI: delete-all-rows）".into(),
+            ));
+        }
+        let pairs = self.select_oid_envelopes(pred, spatial)?;
+        let oids: Vec<i64> = pairs.iter().map(|(o, _)| *o).collect();
+        let deleted_env = pairs.iter().fold(None, |acc: Option<Envelope>, (_, e)| {
+            match (acc, e) {
+                (None, Some(e)) => Some(*e),
+                (Some(a), Some(e)) => Some(a.union(e)),
+                (a, None) => a,
+            }
+        });
+        let affected = if oids.is_empty() {
+            0
+        } else {
+            let del_pred = Predicate::in_ids(self.core.oid_field.clone(), &oids);
+            self.core
+                .backend
+                .delete(&self.core.table_name, &del_pred)?
+        };
+        for oid in &oids {
+            self.delete_shape_index_rows(*oid)?;
+        }
+        self.shrink_extent_after_delete(deleted_env)?;
+        self.core
+            .check_hit(EditResult::new(oids.len() as u64, affected, scope), opts, action)
+    }
+
+    /// 要素类的批量属性/几何更新入口（`ITable::UpdateSearchedRows`）。
+    ///
+    /// 含几何字段时逐要素走 `store`（维护 Shape_Length/Shape_Area、
+    /// `_SHAPE_Index` 与图层范围）；纯属性更新走单条 SQL，效率更高。
+    /// 几何值经 [`Self::geometry_from_value`] 统一解释：Blob / WKT 文本 / Null 均可。
     fn update_features_rows(
         &self,
         sets: &[(String, Value)],
         filter: &QueryFilter,
-    ) -> Result<u64> {
-        // 若批量更新里包含几何，逐要素走 store_row 以维护索引与量算字段
-        if sets
+        opts: EditOptions,
+    ) -> Result<EditResult> {
+        let has_geometry = sets
             .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(&self.shape_field))
-        {
-            let mut cursor = self.update_features(filter.clone())?;
-            let mut n = 0u64;
-            while let Some(mut feature) = cursor.next_feature()? {
-                for (k, v) in sets {
-                    if k.eq_ignore_ascii_case(&self.shape_field) {
-                        if let Value::Blob(b) = v {
-                            feature.set_value(self.shape_index, Value::Blob(b.clone()))?;
-                        }
-                    } else {
-                        feature.set_value_by_name(k, v.clone())?;
-                    }
-                }
-                feature.store()?;
-                n += 1;
-            }
-            return Ok(n);
+            .any(|(n, _)| n.eq_ignore_ascii_case(&self.shape_field));
+        if !has_geometry {
+            return self.core.update_searched_rows(sets, filter, opts);
         }
-        self.core.update_rows(sets, filter)
+        let scope = self.core.check_edit_options(filter, opts, "更新")?;
+        // 写前统一校验几何值，避免"改到第 N 行才报错"的半成品状态
+        for (name, v) in sets {
+            if name.eq_ignore_ascii_case(&self.shape_field) {
+                self.geometry_from_value(v)?;
+            }
+        }
+        let mut cursor = self.update_features(filter.clone())?;
+        let mut n = 0u64;
+        while let Some(mut feature) = cursor.next_feature()? {
+            for (k, v) in sets {
+                if k.eq_ignore_ascii_case(&self.shape_field) {
+                    feature.set_value(self.shape_index, v.clone())?;
+                } else {
+                    feature.set_value_by_name(k, v.clone())?;
+                }
+            }
+            feature.store()?;
+            n += 1;
+        }
+        self.core
+            .check_hit(EditResult::new(n, n, scope), opts, "更新")
     }
 }
 
@@ -600,7 +801,7 @@ impl FeatureClass for PgdbFeatureClass {
         self.spatial_ref.as_ref()
     }
     fn extent(&self) -> Option<Envelope> {
-        self.extent
+        *self.extent.read().unwrap()
     }
     fn grid_info(&self) -> GridInfo {
         self.grid
@@ -640,7 +841,15 @@ impl FeatureClass for PgdbFeatureClass {
         if let Some(geometry) = self.decode_values(&values) {
             let geometry = geometry?;
             let geometry = self.normalize_in_place(&mut values, geometry)?;
-            // 规范化可能改变了 Shape 字节，需要同步更新刚插入的记录
+            // 几何列统一落库为 ESRI 二进制：WKT 文本在此编码，Null 保持 NULL
+            let encoded = self.encode_geometry_value(&geometry)?;
+            if let Some((_, v)) = values
+                .iter_mut()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&self.shape_field))
+            {
+                *v = encoded;
+            }
+            // 编码/规范化可能改变了 Shape 字节，需要同步更新刚插入的记录
             self.core.store_row(Some(oid), &values)?;
             let env = geometry.envelope();
             // 补齐量算字段
@@ -673,7 +882,10 @@ impl FeatureClass for PgdbFeatureClass {
             });
         }
         let env = merged.unwrap_or(Envelope::new(0.0, 0.0, 0.0, 0.0));
-        update_geom_columns_extent(&self.core.backend, &self.core.table_name, &env)?;
+        // 重算的结果是最终事实，必须**覆写**而非并集，
+        // 否则历史上偏大的范围永远无法纠正。
+        set_geom_columns_extent(&self.core.backend, &self.core.table_name, &env)?;
+        *self.extent.write().unwrap() = Some(env);
         Ok(env)
     }
     fn rebuild_shape_index(&self) -> Result<usize> {

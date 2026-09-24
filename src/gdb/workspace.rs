@@ -18,6 +18,7 @@ use crate::error::{PgdbError, Result};
 use crate::value::Value;
 
 use super::dataset::DatasetNode;
+use super::edit::EditOptions;
 use super::featureclass::{FeatureClass, PgdbFeatureClass, WritePolicy};
 use super::featuredataset::{FeatureDataset, PgdbFeatureDataset};
 use super::filter::QueryFilter;
@@ -27,7 +28,8 @@ use super::table::{PgdbTable, Table};
 /// 工作空间打开选项
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceOptions {
-    /// 访问权限：只读（jetdb）或读写（ODBC）。默认读写。
+    /// 访问权限：只读（jetdb）或读写（ODBC）。**默认只读**（零依赖、防误写）；
+    /// 需要写入时显式传 `AccessMode::ReadWrite`。
     pub access_mode: AccessMode,
     /// 几何写入策略
     pub write_policy: WritePolicy,
@@ -321,7 +323,10 @@ impl AccessWorkspace {
         self.catalog.aliases_for(table)
     }
 
-    /// 批量把某个字段更新为固定值（便捷 API）
+    /// 批量把某个字段更新为固定值（便捷 API）。
+    ///
+    /// 内部走 [`Table::update_searched_rows`]（`ITable::UpdateSearchedRows`），
+    /// 受同样的全表防护约束：`filter` 为空过滤器时会被拒绝。
     pub fn update_field_values(
         &self,
         dataset: &str,
@@ -331,7 +336,13 @@ impl AccessWorkspace {
     ) -> Result<u64> {
         let handle = self.open_dataset(dataset)?;
         match handle.as_table() {
-            Some(t) => t.update_rows(&[(field.to_string(), value.clone())], filter),
+            Some(t) => t
+                .update_searched_rows(
+                    &[(field.to_string(), value.clone())],
+                    filter,
+                    EditOptions::default(),
+                )
+                .map(|r| r.affected),
             None => Err(PgdbError::Unsupported(format!("{dataset} 不是表/要素类"))),
         }
     }

@@ -20,16 +20,20 @@ use crate::error::Result;
 /// 该枚举是**运行时**选择后端的唯一开关：调用 [`open_backend`] 时传入即可，
 /// 无需在编译期用 feature 挑选，因此同一个可执行文件同时内置两种解析能力。
 ///
+/// **默认值为 [`AccessMode::ReadOnly`]**——安全且零依赖：只读探查无需任何
+/// ODBC 驱动、不可能误改数据；确实要写时再显式以 [`AccessMode::ReadWrite`]
+/// 打开（CLI: `--access readwrite`）。
+///
 /// - [`AccessMode::ReadOnly`]：选用纯 Rust 的 [`jetdb_backend::JetdbBackend`]，
 ///   无需任何驱动、跨平台，但只能查询。
 /// - [`AccessMode::ReadWrite`]：选用 [`odbc::OdbcBackend`]，经由 ODBC 驱动访问，
 ///   支持属性与几何的写入（需要安装与程序位数匹配的 Access / ACE 驱动）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessMode {
-    /// 只读（jetdb 后端）
+    /// 只读（jetdb 后端，默认权限）
     #[default]
     ReadOnly,
-    /// 读写（ODBC 后端）
+    /// 读写（ODBC 后端，显式选择）
     ReadWrite,
 }
 
@@ -208,6 +212,13 @@ pub enum Predicate {
         /// 目标值
         value: SqlValue,
     },
+    /// 字段取值于给定集合（`col IN (…)`, ODBC/内存后端都支持）
+    In {
+        /// 列名
+        field: String,
+        /// 候选值集合（为空等价于 [`Predicate::Nothing`]）
+        values: Vec<SqlValue>,
+    },
     /// 多个谓词的与组合
     And(Vec<Predicate>),
     /// 原始 SQL 片段（仅 ODBC 后端支持，请自行保证安全与转义）
@@ -221,6 +232,23 @@ impl Predicate {
             field: field.into(),
             value: value.into(),
         }
+    }
+
+    /// 集合谓词（`field IN (…)`），对应 ArcObjects 里按 OID 列表操作的语义
+    pub fn in_values<I, V>(field: impl Into<String>, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<SqlValue>,
+    {
+        Predicate::In {
+            field: field.into(),
+            values: values.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// 便捷构造：按整数主键集合过滤（`OBJECTID IN (1, 2, 3)`）
+    pub fn in_ids(field: impl Into<String>, ids: &[i64]) -> Self {
+        Self::in_values(field, ids.iter().copied())
     }
 
     /// 追加一个条件
@@ -338,6 +366,15 @@ pub fn predicate_matches(filter: &Predicate, row: &DataTableRow) -> bool {
             Some(v) => value_loose_eq(value, v),
             None => false,
         },
+        Predicate::In { field, values } => {
+            if values.is_empty() {
+                return false;
+            }
+            match row.get(field) {
+                Some(v) => values.iter().any(|want| value_loose_eq(want, v)),
+                None => false,
+            }
+        }
         Predicate::And(list) => list.iter().all(|p| predicate_matches(p, row)),
         Predicate::Raw(sql) => eval_where_clause(sql, row),
     }

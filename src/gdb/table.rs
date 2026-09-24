@@ -14,6 +14,7 @@ use crate::value::Value;
 
 use super::cursor::{InsertRowCursor, RowIter};
 use super::dataset::DatasetNode;
+use super::edit::{EditOptions, EditResult, EditScope, Preflight};
 use super::filter::{QueryFilter, SpatialRel};
 use super::metadata::{CatalogEntry, DatasetKind};
 use super::row::Row;
@@ -155,24 +156,162 @@ impl TableCore {
         self.backend.count(&self.table_name, &pred)
     }
 
-    /// 批量更新
-    pub fn update_rows(&self, sets: &[(String, Value)], filter: &QueryFilter) -> Result<u64> {
-        let pred = filter.to_predicate(&self.oid_field);
+    // -------------------------------------------------------------- 编辑防护
+
+    /// 写操作守卫：数据源只读时给出可操作的指引（而非底层驱动错误）。
+    pub(crate) fn ensure_writable(&self, action: &str) -> Result<()> {
+        if self.backend.capabilities().writable {
+            Ok(())
+        } else {
+            Err(PgdbError::read_only(format!(
+                "数据源 {name} 为只读，无法{action}；请以读写权限重新打开 \
+                 （CLI: --access readwrite；库 API: AccessMode::ReadWrite，\
+                 需安装与程序位数匹配的 Access/ACE 驱动）",
+                name = self.name
+            )))
+        }
+    }
+
+    /// 校验 [`EditOptions`]：全表防护与零命中要求由这里统一实施。
+    pub(crate) fn check_edit_options(
+        &self,
+        filter: &QueryFilter,
+        opts: EditOptions,
+        action: &str,
+    ) -> Result<EditScope> {
+        let scope = if filter.is_trivial() {
+            EditScope::WholeTable
+        } else {
+            EditScope::Filtered
+        };
+        self.check_scope(scope, opts, action)
+    }
+
+    /// 按已解析的范围执行全表防护检查
+    pub(crate) fn check_scope(
+        &self,
+        scope: EditScope,
+        opts: EditOptions,
+        action: &str,
+    ) -> Result<EditScope> {
+        if scope.is_whole_table() && !opts.allow_whole_table {
+            return Err(PgdbError::InvalidArgument(format!(
+                "拒绝{action}整张表 {name}：过滤器未包含任何条件。\
+                 如确需作用于全表，请显式确认（EditOptions::whole_table()，CLI 加 --all/--yes）",
+                name = self.name
+            )));
+        }
+        Ok(scope)
+    }
+
+    /// 零命中检查（`require_hit` 时报 NotFound）
+    pub(crate) fn check_hit(
+        &self,
+        result: EditResult,
+        opts: EditOptions,
+        action: &str,
+    ) -> Result<EditResult> {
+        if opts.require_hit && result.is_no_hit() {
+            return Err(PgdbError::not_found(format!(
+                "{action}没有命中任何行（条件可能写错？）"
+            )));
+        }
+        Ok(result)
+    }
+
+    // -------------------------------------------------------------- 批量编辑
+
+    /// 按过滤器批量更新（`ITable::UpdateSearchedRows`）。
+    pub fn update_searched_rows(
+        &self,
+        sets: &[(String, Value)],
+        filter: &QueryFilter,
+        opts: EditOptions,
+    ) -> Result<EditResult> {
+        self.ensure_writable("更新")?;
+        let scope = self.check_edit_options(filter, opts, "更新")?;
         let sql_sets = to_sql_sets(sets, &self.fields, self.oid_field.clone())?;
         if sql_sets.is_empty() {
             return Err(PgdbError::InvalidArgument("没有要更新的字段".into()));
         }
-        self.backend.update(&self.table_name, &sql_sets, &pred)
+        let pred = filter.to_predicate(&self.oid_field);
+        let matched = self.backend.count(&self.table_name, &pred)?;
+        let affected = if matched == 0 {
+            0
+        } else {
+            self.backend.update(&self.table_name, &sql_sets, &pred)?
+        };
+        self.check_hit(EditResult::new(matched, affected, scope), opts, "更新")
     }
 
-    /// 批量删除
-    pub fn delete_rows(&self, filter: &QueryFilter) -> Result<u64> {
+    /// 按过滤器批量删除（`ITable::DeleteSearchedRows`）。
+    pub fn delete_searched_rows(
+        &self,
+        filter: &QueryFilter,
+        opts: EditOptions,
+    ) -> Result<EditResult> {
+        self.ensure_writable("删除")?;
+        let scope = self.check_edit_options(filter, opts, "删除")?;
         let pred = filter.to_predicate(&self.oid_field);
-        self.backend.delete(&self.table_name, &pred)
+        let matched = self.backend.count(&self.table_name, &pred)?;
+        let affected = if matched == 0 {
+            0
+        } else {
+            self.backend.delete(&self.table_name, &pred)?
+        };
+        self.check_hit(EditResult::new(matched, affected, scope), opts, "删除")
+    }
+
+    /// 按 OBJECTID 列表删除（`ITable::DeleteRows`，ArcObjects 语义：参数是 OID 数组）。
+    pub fn delete_rows(&self, oids: &[i64]) -> Result<EditResult> {
+        self.ensure_writable("删除")?;
+        if oids.is_empty() {
+            return Ok(EditResult::new(0, 0, EditScope::Filtered));
+        }
+        let pred = Predicate::in_ids(self.oid_field.clone(), oids);
+        let matched = self.backend.count(&self.table_name, &pred)?;
+        let affected = if matched == 0 {
+            0
+        } else {
+            self.backend.delete(&self.table_name, &pred)?
+        };
+        Ok(EditResult::new(matched, affected, EditScope::Filtered))
+    }
+
+    /// 清空整张表（`ITable::DeleteAllRows` 语义）。
+    ///
+    /// 全表操作即本方法的本意，因此内部直接放行全表检查；
+    /// 危险性由 CLI 的 `--yes` 与调用方自行把关。
+    pub fn delete_all_rows(&self) -> Result<EditResult> {
+        self.ensure_writable("清空")?;
+        let matched = self.backend.count(&self.table_name, &Predicate::All)?;
+        let affected = if matched == 0 {
+            0
+        } else {
+            self.backend.delete(&self.table_name, &Predicate::All)?
+        };
+        Ok(EditResult::new(matched, affected, EditScope::WholeTable))
+    }
+
+    /// 编辑前体检（只读探测，不写库）。
+    pub fn preflight_edit(&self, filter: &QueryFilter) -> Result<Preflight> {
+        let scope = if filter.is_trivial() {
+            EditScope::WholeTable
+        } else {
+            EditScope::Filtered
+        };
+        let pred = filter.to_predicate(&self.oid_field);
+        let matched = self.backend.count(&self.table_name, &pred)?;
+        Ok(Preflight {
+            matched,
+            scope,
+            writable: self.backend.capabilities().writable,
+        })
     }
 
     /// 单条插入，返回 OBJECTID
     pub fn insert_row(&self, values: &[(String, Value)]) -> Result<i64> {
+        self.ensure_writable("插入")?;
         let sql_vals = to_sql_inserts(values, &self.fields, self.oid_field.clone())?;
         if sql_vals.is_empty() {
             return Err(PgdbError::InvalidArgument("没有可插入的字段值".into()));
@@ -182,6 +321,7 @@ impl TableCore {
 
     /// 单条保存
     pub fn store_row(&self, oid: Option<i64>, sets: &[(String, Value)]) -> Result<()> {
+        self.ensure_writable("更新")?;
         let Some(oid) = oid else {
             return Err(PgdbError::InvalidArgument(
                 "没有 OBJECTID，无法定位待更新的行".into(),
@@ -204,15 +344,7 @@ impl TableCore {
 
     /// 单条删除
     pub fn delete_row(&self, oid: i64) -> Result<()> {
-        let pred = Predicate::eq(&self.oid_field, oid);
-        let n = self.backend.delete(&self.table_name, &pred)?;
-        if n == 0 {
-            return Err(PgdbError::NotFound(format!(
-                "表 {} 中 OBJECTID={} 的行不存在",
-                self.table_name, oid
-            )));
-        }
-        Ok(())
+        self.delete_rows(&[oid]).map(|_| ())
     }
 
     /// 按 OBJECTID 取一行
@@ -260,8 +392,8 @@ fn to_sql_inserts(
     sanitize(values, fields, oid_field)
 }
 
-/// 内存中的空间关系判断（基于包络矩形，够 Rao reliable 用于粗筛）
-fn spatial_match(rel: &SpatialRel, a: Option<Envelope>, b: &Envelope) -> bool {
+/// 内存中的空间关系判断（基于包络矩形，够 reliable 用于粗筛）
+pub(crate) fn spatial_match(rel: &SpatialRel, a: Option<Envelope>, b: &Envelope) -> bool {
     let Some(a) = a else { return false };
     match rel {
         SpatialRel::Intersects | SpatialRel::Overlaps | SpatialRel::Touches => a.intersects(b),
@@ -304,11 +436,30 @@ pub trait Table: DatasetNode {
     /// 行数（`ITable::RowCount`）
     fn row_count(&self, filter: &QueryFilter) -> Result<u64>;
 
-    /// 批量更新
-    fn update_rows(&self, sets: &[(String, Value)], filter: &QueryFilter) -> Result<u64>;
+    /// 按过滤器批量更新（`ITable::UpdateSearchedRows`）。
+    ///
+    /// 全表防护与零命中语义见 [`EditOptions`]；返回的 [`EditResult`]
+    /// 能区分「零命中」与「全表」两类风险。
+    fn update_searched_rows(
+        &self,
+        sets: &[(String, Value)],
+        filter: &QueryFilter,
+        opts: EditOptions,
+    ) -> Result<EditResult>;
 
-    /// 批量删除
-    fn delete_rows(&self, filter: &QueryFilter) -> Result<u64>;
+    /// 按过滤器批量删除（`ITable::DeleteSearchedRows`）。
+    fn delete_searched_rows(&self, filter: &QueryFilter, opts: EditOptions) -> Result<EditResult>;
+
+    /// 按 OBJECTID 列表删除（`ITable::DeleteRows` —— ArcObjects 中该方法
+    /// 接收的是 OID 数组而非过滤器）。
+    fn delete_rows(&self, oids: &[i64]) -> Result<EditResult>;
+
+    /// 清空整张表（`ITable::DeleteAllRows` 语义）。
+    fn delete_all_rows(&self) -> Result<EditResult>;
+
+    /// 编辑前体检（`ISelectionSet::Count` + `IWorkspace::IsReadOnly` 语义），
+    /// 只读探测，不写库。
+    fn preflight_edit(&self, filter: &QueryFilter) -> Result<Preflight>;
 
     /// 插入一行
     fn insert_row(&self, values: &[(String, Value)]) -> Result<i64>;
@@ -393,7 +544,8 @@ impl DatasetNode for PgdbTable {
         Some(Table::row_count(self, &QueryFilter::new()))
     }
     fn update_any(&self, filter: &QueryFilter, sets: &[(String, Value)]) -> Result<u64> {
-        self.update_rows(sets, filter)
+        self.update_searched_rows(sets, filter, EditOptions::default())
+            .map(|r| r.affected)
     }
 }
 
@@ -430,11 +582,25 @@ impl Table for PgdbTable {
     fn row_count(&self, filter: &QueryFilter) -> Result<u64> {
         self.core.row_count(filter)
     }
-    fn update_rows(&self, sets: &[(String, Value)], filter: &QueryFilter) -> Result<u64> {
-        self.core.update_rows(sets, filter)
+    fn update_searched_rows(
+        &self,
+        sets: &[(String, Value)],
+        filter: &QueryFilter,
+        opts: EditOptions,
+    ) -> Result<EditResult> {
+        self.core.update_searched_rows(sets, filter, opts)
     }
-    fn delete_rows(&self, filter: &QueryFilter) -> Result<u64> {
-        self.core.delete_rows(filter)
+    fn delete_searched_rows(&self, filter: &QueryFilter, opts: EditOptions) -> Result<EditResult> {
+        self.core.delete_searched_rows(filter, opts)
+    }
+    fn delete_rows(&self, oids: &[i64]) -> Result<EditResult> {
+        self.core.delete_rows(oids)
+    }
+    fn delete_all_rows(&self) -> Result<EditResult> {
+        self.core.delete_all_rows()
+    }
+    fn preflight_edit(&self, filter: &QueryFilter) -> Result<Preflight> {
+        self.core.preflight_edit(filter)
     }
     fn insert_row(&self, values: &[(String, Value)]) -> Result<i64> {
         self.core.insert_row(values)

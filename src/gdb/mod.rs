@@ -2,6 +2,7 @@
 
 pub mod cursor;
 pub mod dataset;
+pub mod edit;
 pub mod factory;
 pub mod featureclass;
 pub mod featuredataset;
@@ -13,6 +14,7 @@ pub mod workspace;
 
 pub use cursor::{FeatureIter, InsertFeatureCursor, InsertRowCursor, RowIter};
 pub use dataset::DatasetNode;
+pub use edit::{EditOptions, EditResult, EditScope, Preflight};
 pub use factory::{
     contains_feature_class, open_workspace, open_workspace_read_only, AccessWorkspaceFactory,
     WorkspaceFactory,

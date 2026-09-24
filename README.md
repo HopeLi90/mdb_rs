@@ -76,27 +76,30 @@ cargo test     # 单元测试 + 集成测试 + 文档测试
 
 | 读写权限 | 后端 | 是否需要驱动 | 能力 |
 |----------|------|--------------|------|
-| `AccessMode::ReadOnly` | 纯 Rust 的 **jetdb** | **不需要**，跨平台（含 WASM） | 仅查询 |
-| `AccessMode::ReadWrite` | **ODBC** | 需要与程序位数匹配的 Access/ACE 驱动 | 查询 + 写入 |
+| `AccessMode::ReadOnly`（**默认**） | 纯 Rust 的 **jetdb** | **不需要**，跨平台（含 WASM） | 仅查询 |
+| `AccessMode::ReadWrite`（显式选择） | **ODBC** | 需要与程序位数匹配的 Access/ACE 驱动 | 查询 + 写入 |
 
-选择原则很直白：**只想看数据**就用只读模式（零依赖、随处可跑）；**需要改数据**才用读写模式。
+**默认权限是只读**：安全（任何写操作都被明确拒绝）且零依赖（无驱动即可探查数据）；
+**需要改数据**时才显式以读写权限打开。
 
 ```rust
 use pgdb::gdb::{AccessMode, AccessWorkspaceFactory};
 
-// 只读：纯 Rust 解析 test.mdb，无需安装任何驱动
+// 默认（不传权限）即只读：纯 Rust 解析，无需安装任何驱动
+let ws = AccessWorkspaceFactory.open("test.mdb", None)?;
+// 也可以显式声明
 let ws = AccessWorkspaceFactory::open_with_mode("test.mdb", AccessMode::ReadOnly, None)?;
 
-// 读写：走 ODBC（Windows 需装好与程序位数匹配的 ACE 驱动）
+// 读写：必须显式传 AccessMode::ReadWrite（Windows 需装好与程序位数匹配的 ACE 驱动）
 let ws = AccessWorkspaceFactory::open_with_mode("test.mdb", AccessMode::ReadWrite, None)?;
 ```
 
-命令行对应 `--access`：
+命令行对应 `--access`（默认 `readonly`）：
 
 ```bash
-pgdb-cli test.mdb --access readonly  tree     # jetdb，无需驱动
-pgdb-cli test.mdb --access readwrite info     # ODBC，需驱动
-pgdb-cli test.mdb --read-only        rows QLR # readonly 的简写
+pgdb-cli test.mdb tree                        # 默认只读：jetdb，无需驱动
+pgdb-cli --read-only   test.mdb rows QLR      # 兼容的显式简写
+pgdb-cli --access readwrite test.mdb info     # ODBC，需驱动（写入必须）
 ```
 
 > 只读模式下任何写操作都会被**明确拒绝**（并提示改用 `--access readwrite`），
@@ -133,9 +136,17 @@ cargo run --example shape_codec
 ## 命令行工具 `pgdb-cli`
 
 ```bash
-pgdb-cli <数据源> <子命令> [选项]
-# 数据源为真实 *.mdb（需 odbc feature 与驱动）
+pgdb-cli [全局选项] <数据源> <子命令> [选项]
+# 数据源为真实 *.mdb / *.accdb
 ```
+
+全局选项（决定后端与写保护）：
+
+| 选项 | 作用 |
+|------|------|
+| `--access readonly`（**默认**，`--read-only` 为兼容简写） | 纯 Rust **jetdb** 解析（无需驱动、跨平台），仅查询 |
+| `--access readwrite` | **ODBC** 驱动解析（可写，需匹配位数的 Access/ACE 驱动），写入时必须显式指定 |
+| `--dry-run` | 更新/删除命令只做预检（命中行数/范围/可写性），不写库 |
 
 | 子命令 | 作用 | 主要选项 |
 |--------|------|----------|
@@ -146,11 +157,13 @@ pgdb-cli <数据源> <子命令> [选项]
 | `fields <ds>` | 字段定义、空间参考、图层范围、网格 | – |
 | `rows <ds>` | 打印数据行 | `--oid` `--where` `--fields` `--limit` |
 | `export-wkt <fc>` | 导出 WKT | `--output` `--precision` `--oid` |
-| `update-attr <ds>` | 属性更新 | `--set FIELD=VALUE`（可多次）`--oid` `--where` |
+| `preflight <ds>` | 编辑前体检：命中行数/范围/可写性，只读不写库 | `--oid` `--where` |
+| `update-attr <ds>` | 批量属性更新（`UpdateSearchedRows`） | `--set FIELD=VALUE`（可多次）`--oid` `--where` `--all` |
 | `set-geometry <fc>` | 几何更新 | `--wkt` / `--wkt-file`、`--oid` `--where` |
 | `create-feature <fc>` | 新建要素 | `--wkt`、`--set FIELD=VALUE` |
 | `create-row <ds>` | 新建属性行 | `--set FIELD=VALUE` |
-| `delete-rows <ds>` | 删除行 | `--oid` `--where` `--yes` |
+| `delete-rows <ds>` | 删除行 | `--oids 1,2,3`（`ITable::DeleteRows`）/ `--oid` `--where` / `--yes` |
+| `delete-all-rows <ds>` | 清空整张表（`DeleteAllRows`） | `--yes` |
 | `rebuild-index <fc>` | 重建 `<表>_SHAPE_Index` 并重算图层范围 | – |
 | `sql <stmt>` | 原始 SQL（仅 ODBC 后端可用） | – |
 
@@ -165,19 +178,21 @@ pgdb-cli 你的库.mdb tree
 # 要素数据集  Hydrology（含 1 个要素类）
 #     要素类      Hydrology\Ponds（几何类型：面），2 行
 
-pgdb-cli 你的库.mdb update-attr Roads --oid 1 --set NAME=长安街
-pgdb-cli 你的库.mdb set-geometry Roads --oid 2 --wkt 'LINESTRING(20 20, 30 30)'
-pgdb-cli 你的库.mdb create-feature 'Hydrology\Ponds' \
-    --wkt 'POLYGON((10 10, 10 12, 12 12, 12 10, 10 10))' --set NAME=池塘C
-pgdb-cli 你的库.mdb export-wkt 'Hydrology\Ponds'
-```
+# 只读探查：默认权限即 readonly（jetdb 后端，无需任何驱动）
+pgdb-cli 你的库.mdb rows Roads --limit 10
 
-打开真实 mdb：
+# 编辑前体检 / 演练
+pgdb-cli --dry-run 你的库.mdb delete-rows Roads --oids 1,2,999
+pgdb-cli 你的库.mdb preflight Roads --where "NAME = 'G1'"
 
-```bash
-cargo build
-./target/debug/pgdb-cli 你的库.mdb tree
-./target/debug/pgdb-cli 你的库.mdb drivers   # 排查驱动
+# 写操作必须显式 --access readwrite（ODBC 后端，需驱动）
+pgdb-cli --access readwrite 你的库.mdb update-attr Roads --oid 1 --set NAME=长安街
+pgdb-cli --access readwrite 你的库.mdb update-attr Roads --set REMARK=已核对 --all
+
+# 删除：OID 列表（忽略 --where），或按条件；都必须 --yes
+pgdb-cli --access readwrite 你的库.mdb delete-rows Roads --oids 3,4 --yes
+pgdb-cli --access readwrite 你的库.mdb delete-rows Roads --where "NAME = '旧路'" --yes
+pgdb-cli --access readwrite 你的库.mdb delete-all-rows 临时表 --yes
 ```
 
 Windows 下的驱动自动探测顺序（DSN-less，`DBQ=` 直指文件）：
@@ -259,6 +274,56 @@ let new_oid = insert.insert_feature()?;
 insert.flush()?;
 ```
 
+### 批量编辑（`ITable::UpdateSearchedRows` / `DeleteSearchedRows`）
+
+按 [`QueryFilter`] 批量更新/删除，返回 [`EditResult`]（命中数/影响数/范围），
+用 [`EditOptions`] 声明防护要求——**默认拒绝全表、允许零命中**：
+
+```rust
+use pgdb::gdb::{EditOptions, EditResult, EditScope, QueryFilter, Table};
+
+let table = ws.open_table("OwnerTable")?;
+
+// 按条件更新：返回命中与影响行数，零命中不再是"静默无事"
+let result: EditResult = table.update_searched_rows(
+    &[("REMARK".to_string(), pgdb::Value::String("已核对".into()))],
+    &QueryFilter::new().with_where("NAME = '北京市'"),
+    EditOptions::default(),               // 拒绝全表 + 允许零命中
+)?;
+println!("{result}");                     // 命中 1 行，影响 1 行（按条件过滤）
+
+// 全表更新必须显式放行（防止 QueryFilter::new() 笔误清库）
+table.update_searched_rows(
+    &[("REMARK".to_string(), pgdb::Value::String("批量备注".into()))],
+    &QueryFilter::new(),
+    EditOptions::default().whole_table(),
+)?;
+
+// 按 OBJECTID 列表删除（ITable::DeleteRows 的 OID 数组语义）
+let result = table.delete_rows(&[3, 4, 5])?;
+if result.matched < 3 {
+    eprintln!("有 {} 个 OID 不存在", 3 - result.matched as usize);
+}
+
+// "必须命中"的场景：零命中直接报 NotFound，适合单条业务操作
+table.delete_searched_rows(
+    &QueryFilter::for_oid(2),
+    EditOptions::default().require_hit(),
+)?;
+
+// 清空整张表（ITable::DeleteAllRows）
+let result = table.delete_all_rows()?;
+
+// 编辑前体检（ISelectionSet::Count + IWorkspace::IsReadOnly），只读不写库
+let pre = table.preflight_edit(&QueryFilter::new())?;
+println!("{pre}");                        // 预检：命中 2 行（全表），数据源可写
+```
+
+对要素类（`FeatureClass`）调用同样的方法时，删除会**同步清理
+`<表>_SHAPE_Index` 并回缩 `GDB_GeomColumns` 图层范围**（被删要素不触及
+边界时跳过 O(n) 重算），几何更新接受 ESRI 二进制 / WKT 文本 / `Null`
+三态值并统一归一落库。
+
 ### 写入策略 `WritePolicy`
 
 几何写入默认会做这些 ESRI 一致性维护，可按需关闭：
@@ -276,8 +341,8 @@ insert.flush()?;
 use pgdb::gdb::{AccessWorkspaceFactory, WritePolicy};
 
 let policy = WritePolicy { maintain_shape_index: false, ..WritePolicy::default() };
-// 真实 mdb 直接走 ODBC 后端；写策略在打开后通过工作空间选项生效
-// 只读探查走 jetdb（无需驱动）；需要写入时改成 AccessMode::ReadWrite（走 ODBC）
+// 默认打开权限即只读（jetdb，无需驱动）；写策略在打开后通过工作空间选项生效
+// 需要写入时显式传 AccessMode::ReadWrite（走 ODBC，需驱动）
 let ws = AccessWorkspaceFactory::open_with_mode("你的库.mdb", AccessMode::ReadOnly, None)?;
 // policy 可用于后续更新时控制是否维护空间索引等一致性数据
 ```
@@ -297,6 +362,11 @@ let ws = AccessWorkspaceFactory::open_with_mode("你的库.mdb", AccessMode::Rea
 | `IDataset` | `DatasetNode` |
 | `IFeatureDataset` | `FeatureDataset`（`subsets`） |
 | `ITable` | `Table`（`search` / `update` / `insert_cursor` / `get_row`） |
+| `ITable::UpdateSearchedRows` / `ITable::DeleteSearchedRows` | `Table::update_searched_rows` / `Table::delete_searched_rows`（`EditOptions` + `EditResult`） |
+| `ITable::DeleteRows`（OID 数组） | `Table::delete_rows(&[i64])` |
+| `ITable::DeleteAllRows` | `Table::delete_all_rows` |
+| `ISelectionSet::Count` + `IWorkspace::IsReadOnly` | `Table::preflight_edit`（`Preflight`） |
+| `IWorkspaceEdit` 的确认语义 | `EditOptions::whole_table()` / `require_hit()` |
 | `IFeatureClass` | `FeatureClass`（`search_features` / `update_features` / `insert_feature_cursor`） |
 | `IRowBuffer` / `IFeatureBuffer` | `RowBuffer` |
 | `IRow` / `IFeature` | `Row` / `Feature`（`store` / `delete` / `set_geometry`） |
@@ -384,11 +454,14 @@ GDB_FieldInfo        TableName / FieldName / AliasName（字段别名）
 
 ```bash
 cargo test
-# lib: 33 个单元测试（几何编解码 / WKT / 谓词 / SQL 构造 / 排版）
+# lib: 52 个单元测试（几何编解码 / WKT / 谓词 / SQL 构造 / 排版 / 编辑防护）
+# tests/access_mode.rs: 6 个用例（双后端选择、数据集/几何/中文、写拒绝）
+# tests/edit_ops.rs: 13 个用例（批量编辑契约：EditOptions 防护、EditResult、
+#                     preflight、索引清理、范围回缩、WKT/Blob/Null 三态几何）
 # tests/integration.rs: 10 个用例（目录树遍历、双元数据模型、游标读写、
 #                       空间过滤、面环方向归一化、索引与范围一致性、shapefile 兼容）
 # tests/test_mdb.rs: 9 个基准库验收用例（见下，默认忽略）
-# doc-tests: 2 个（README 级示例保证可编译）
+# doc-tests: 3 个（README 级示例保证可编译）
 ```
 
 ### 基准库验收测试（`tests/test_mdb.rs`）
